@@ -1,22 +1,26 @@
 {
   "whisper": {
-    "binary": "./whisper-cpp/main",
-    "model": "./models/ggml-medium.bin",
+    "binary": "/home/roman/github/whisper.cpp/build/bin/whisper-cli",
+    "model": "/home/roman/github/whisper.cpp/models/ggml-small.bin",
     "language": "ru",
-    "extra_args": []
+    "extra_args": [
+      "--no-prints",
+      "--max-len", "100",
+      "--split-on-word"
+    ]
   },
   "ollama": {
     "base_url": "http://localhost:11434",
-    "model": "llama3.1",
+    "model": "llama3.2:latest",
     "temperature": 0.3,
     "stream": true
   },
   "analysis": {
-    "buffer_lines": 3,
+    "buffer_lines": 5,
     "context_window": 20
   },
   "prompts": {
-    "system": "Ты — аналитик игры в Мафию. Тебе передаётся транскрипт живой игры.\nТвоя задача: анализировать поведение игроков и выявлять подозрительных.\n\nФормат ответа — строго JSON:\n{\n  \"suspicion\": [\n    {\"player\": \"имя или номер\", \"score\": 0-10, \"reason\": \"...\"}\n  ],\n  \"key_phrases\": [\"фраза1\", \"фраза2\"],\n  \"summary\": \"краткий вывод 1-2 предложения\"\n}\n\nПравила:\n- score 0 = явно мирный, 10 = явно мафия\n- Обращай внимание на уклончивые ответы, защиту мафии, нелогичные обвинения\n- Если данных мало — честно укажи низкую уверенность",
-    "user_template": "Текущий фрагмент транскрипта:\n---\n%s\n---\nПроанализируй этот фрагмент в контексте всей игры."
+    "system": "Ты — профессиональный судья и аналитик игры Мафия. Игра ещё идёт — анализируй постепенно, обновляй карту с каждым новым фрагментом. Не делай финальных выводов пока игра не закончена.",
+    "user_template": "Обнови карту игры с учётом нового фрагмента.\nВерни ТОЛЬКО JSON без markdown, без пояснений, без ```json — только сам объект:\n{\n  \"game_flow\": \"обновлённая хронология всей игры\",\n  \"player_profiles\": [\n    {\n      \"identified_id\": \"номер или имя\",\n      \"suspicions\": \"кого подозревает\",\n      \"aggression_level\": 0,\n      \"is_likely_mafia\": false,\n      \"reasoning\": \"накопленный вывод с учётом всех фрагментов\"\n    }\n  ]\n}"
   }
 }

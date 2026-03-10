@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mafia-analyzer/config"
+	"mafia-analyzer/config"
 )
 
 // Message is a single chat message
@@ -20,16 +20,37 @@ type Message struct {
 	Content string `json:"content"`
 }
 
-// AnalysisResult is the structured JSON we expect from the model
-type AnalysisResult struct {
-	Suspicion []struct {
-		Player string `json:"player"`
-		Score  int    `json:"score"`
-		Reason string `json:"reason"`
-	} `json:"suspicion"`
-	KeyPhrases []string `json:"key_phrases"`
-	Summary    string   `json:"summary"`
-	Raw        string   `json:"-"` // full raw response before JSON parse
+// PlayerProfile описывает одного игрока в карте игры
+type PlayerProfile struct {
+	IdentifiedID    string `json:"identified_id"`
+	Suspicions      string `json:"suspicions"`
+	AggressionLevel int    `json:"aggression_level"`
+	IsLikelyMafia   bool   `json:"is_likely_mafia"`
+	Reasoning       string `json:"reasoning"`
+}
+
+// GameMap — накопительная карта игры, обновляется с каждым чанком
+type GameMap struct {
+	GameFlow       string          `json:"game_flow"`
+	PlayerProfiles []PlayerProfile `json:"player_profiles"`
+	Raw            string          `json:"-"` // полный сырой ответ модели
+}
+
+// IsEmpty возвращает true если карта ещё не заполнена
+func (g *GameMap) IsEmpty() bool {
+	return g.GameFlow == "" && len(g.PlayerProfiles) == 0
+}
+
+// ToJSON сериализует карту в JSON строку для передачи в следующий промпт
+func (g *GameMap) ToJSON() string {
+	if g.IsEmpty() {
+		return "{}"
+	}
+	b, err := json.MarshalIndent(g, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 type Client struct {
@@ -62,9 +83,8 @@ type streamChunk struct {
 	Done bool `json:"done"`
 }
 
-// Analyze sends the transcript fragment + context to Ollama and returns analysis.
-// If stream=true in config, it streams tokens and assembles the full response.
-func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (*AnalysisResult, error) {
+// Analyze отправляет промпт в Ollama и возвращает обновлённую карту игры
+func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (*GameMap, error) {
 	req := chatRequest{
 		Model: c.cfg.Model,
 		Messages: []Message{
@@ -123,23 +143,20 @@ func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (
 	}
 
 	raw := fullText.String()
-	result := &AnalysisResult{Raw: raw}
+	gameMap := &GameMap{Raw: raw}
 
-	// attempt to parse JSON — model may wrap it in markdown fences
 	jsonStr := extractJSON(raw)
 	if jsonStr != "" {
-		if err := json.Unmarshal([]byte(jsonStr), result); err != nil {
-			// not fatal — we still have Raw
-			return result, nil
+		if err := json.Unmarshal([]byte(jsonStr), gameMap); err != nil {
+			return gameMap, nil
 		}
 	}
 
-	return result, nil
+	return gameMap, nil
 }
 
-// extractJSON tries to pull a JSON object out of a string that may have markdown
+// extractJSON вытаскивает JSON объект из строки с возможными markdown фенсами
 func extractJSON(s string) string {
-	// strip ```json ... ``` fences
 	if idx := strings.Index(s, "```json"); idx != -1 {
 		s = s[idx+7:]
 		if end := strings.Index(s, "```"); end != -1 {
@@ -153,7 +170,6 @@ func extractJSON(s string) string {
 	}
 	s = strings.TrimSpace(s)
 
-	// find outermost { }
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start == -1 || end == -1 || end <= start {

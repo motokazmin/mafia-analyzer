@@ -10,13 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mafia-analyzer/config"
-	"github.com/mafia-analyzer/internal/analyzer"
-	"github.com/mafia-analyzer/internal/ollama"
-	"github.com/mafia-analyzer/internal/whisper"
+	"mafia-analyzer/config"
+	"mafia-analyzer/internal/analyzer"
+	"mafia-analyzer/internal/ollama"
+	"mafia-analyzer/internal/whisper"
 )
 
-// ANSI color codes for readable stdout
 const (
 	colorReset  = "\033[0m"
 	colorCyan   = "\033[36m"
@@ -27,12 +26,12 @@ const (
 )
 
 func main() {
-	configPath := flag.String("config", "config/config.yaml", "path to config file")
+	configPath := flag.String("config", "config/config.json", "path to config file")
 	audioFile := flag.String("audio", "", "audio file to transcribe (required)")
 	flag.Parse()
 
 	if *audioFile == "" {
-		fmt.Fprintf(os.Stderr, "Usage: mafia-analyzer -audio <file.wav> [-config <config.yaml>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: mafia-analyzer -audio <file> [-config <config.json>]\n")
 		os.Exit(1)
 	}
 
@@ -52,10 +51,9 @@ func main() {
 	whisperRunner := whisper.NewRunner(&cfg.Whisper)
 	an := analyzer.New(cfg, ollamaClient)
 
-	// verify ollama is reachable
 	logf(colorGray, "INIT", "checking ollama at %s ...", cfg.Ollama.BaseURL)
 	if err := checkOllama(cfg.Ollama.BaseURL); err != nil {
-		logf(colorYellow, "WARN", "ollama check failed: %v (will retry on first analysis)", err)
+		logf(colorYellow, "WARN", "ollama check failed: %v", err)
 	} else {
 		logf(colorGreen, "INIT", "ollama OK — model: %s", cfg.Ollama.Model)
 	}
@@ -77,16 +75,23 @@ loop:
 			totalLines++
 			logf(colorGray, "TRANSCRIPT", "[%d] %s", totalLines, line.Text)
 
+			// логируем отправку в ollama когда буфер заполнен
+			if an.IsBufferFull(line.Text) {
+				logf(colorYellow, "OLLAMA", "→ sending chunk #%d to ollama | %s",
+					totalAnalyses+1, an.Stats())
+			}
+
 			t0 := time.Now()
-			result, err := an.AddLine(ctx, line.Text)
+			gameMap, err := an.AddLine(ctx, line.Text)
 			if err != nil {
 				logf(colorRed, "ERROR", "analysis: %v", err)
 				continue
 			}
-			if result != nil {
+			if gameMap != nil {
 				totalAnalyses++
 				elapsed := time.Since(t0)
-				fmt.Print(analyzer.FormatResult(result, elapsed))
+				logf(colorGreen, "OLLAMA", "← got response #%d in %.1fs", totalAnalyses, elapsed.Seconds())
+				fmt.Print(analyzer.FormatResult(gameMap, totalAnalyses, elapsed))
 			}
 
 		case err, ok := <-errc:
@@ -105,20 +110,26 @@ loop:
 		}
 	}
 
-	// flush remaining buffer
+	// финальный flush остатка буфера
 	if ctx.Err() == nil {
-		logf(colorCyan, "FLUSH", "flushing remaining %s", an.Stats())
+		logf(colorCyan, "FLUSH", "finalizing... %s", an.Stats())
+		logf(colorYellow, "OLLAMA", "→ sending final chunk to ollama")
 		t0 := time.Now()
-		result, err := an.Flush(ctx)
+		gameMap, err := an.Flush(ctx)
 		if err != nil {
 			logf(colorRed, "ERROR", "final flush: %v", err)
-		} else if result != nil {
+		} else if gameMap != nil {
 			totalAnalyses++
-			fmt.Print(analyzer.FormatResult(result, time.Since(t0)))
+			elapsed := time.Since(t0)
+			logf(colorGreen, "OLLAMA", "← got final response in %.1fs", elapsed.Seconds())
+			fmt.Print(analyzer.FormatResult(gameMap, totalAnalyses, elapsed))
 		}
+
+		// финальная карта игры
+		fmt.Print(analyzer.FormatFinalMap(an.CurrentGameMap()))
 	}
 
-	logf(colorGreen, "DONE", "transcript lines=%d analyses=%d total_time=%s",
+	logf(colorGreen, "DONE", "lines=%d analyses=%d time=%s",
 		totalLines, totalAnalyses, time.Since(startTime).Round(time.Second))
 }
 

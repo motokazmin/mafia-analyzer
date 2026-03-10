@@ -8,13 +8,13 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/mafia-analyzer/config"
+	"mafia-analyzer/config"
 )
 
 // Line represents a single transcribed line from whisper
 type Line struct {
 	Text string
-	Raw  string // original whisper output before cleanup
+	Raw  string
 }
 
 // Runner manages the whisper subprocess
@@ -26,8 +26,7 @@ func NewRunner(cfg *config.WhisperConfig) *Runner {
 	return &Runner{cfg: cfg}
 }
 
-// TranscribeFile runs whisper on a single audio file and streams lines via channel.
-// The channel is closed when whisper exits or ctx is cancelled.
+// TranscribeFile запускает whisper и читает строки по мере появления через StdoutPipe
 func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan Line, <-chan error) {
 	lines := make(chan Line, 32)
 	errc := make(chan error, 1)
@@ -38,6 +37,7 @@ func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan L
 
 		args := r.buildArgs(audioFile)
 		cmd := exec.CommandContext(ctx, r.cfg.Binary, args...)
+		cmd.Stderr = io.Discard
 
 		stdout, err := cmd.StdoutPipe()
 		if err != nil {
@@ -45,20 +45,10 @@ func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan L
 			return
 		}
 
-		// whisper writes progress/info to stderr — capture it separately
-		stderr, err := cmd.StderrPipe()
-		if err != nil {
-			errc <- fmt.Errorf("stderr pipe: %w", err)
-			return
-		}
-
 		if err := cmd.Start(); err != nil {
 			errc <- fmt.Errorf("start whisper: %w", err)
 			return
 		}
-
-		// drain stderr in background (prevents blocking)
-		go drainStderr(stderr)
 
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
@@ -75,7 +65,6 @@ func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan L
 		}
 
 		if err := cmd.Wait(); err != nil {
-			// context cancellation causes exit error — treat as normal
 			if ctx.Err() == nil {
 				errc <- fmt.Errorf("whisper exit: %w", err)
 			}
@@ -90,40 +79,31 @@ func (r *Runner) buildArgs(audioFile string) []string {
 		"-m", r.cfg.Model,
 		"-f", audioFile,
 		"--language", r.cfg.Language,
-		"--no-timestamps",        // clean output without [00:00 --> 00:05]
-		"--output-txt",           // also write .txt file alongside audio
-		"--print-special", "0",   // suppress [BLANK_AUDIO] etc.
 	}
 	args = append(args, r.cfg.ExtraArgs...)
 	return args
 }
 
-// cleanLine strips whisper artifacts from output line
+// cleanLine вырезает тайминги whisper и возвращает чистый текст
+// формат строки: [00:00:00.000 --> 00:00:05.000]   Текст сегмента
 func cleanLine(s string) string {
 	s = strings.TrimSpace(s)
-
-	// skip empty, timing lines, and whisper meta-output
 	if s == "" {
 		return ""
 	}
-	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
-		return "" // [BLANK_AUDIO], [MUSIC], etc.
-	}
-	if strings.Contains(s, "-->") {
-		return "" // timestamp lines if they slip through
-	}
-	// whisper sometimes prefixes lines with spaces or "  "
-	s = strings.TrimLeft(s, " \t")
 
-	return s
-}
-
-func drainStderr(r io.Reader) {
-	buf := make([]byte, 4096)
-	for {
-		_, err := r.Read(buf)
-		if err != nil {
-			return
+	// вырезаем тайминги [00:00:00.000 --> 00:00:05.000]
+	if strings.HasPrefix(s, "[") {
+		idx := strings.Index(s, "]")
+		if idx != -1 {
+			s = strings.TrimSpace(s[idx+1:])
 		}
 	}
+
+	// фильтруем оставшиеся служебные теги [BLANK_AUDIO] и т.д.
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		return ""
+	}
+
+	return s
 }

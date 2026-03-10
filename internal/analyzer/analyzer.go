@@ -2,35 +2,37 @@ package analyzer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/mafia-analyzer/config"
-	"github.com/mafia-analyzer/internal/ollama"
+	"mafia-analyzer/config"
+	"mafia-analyzer/internal/ollama"
 )
 
-// Analyzer accumulates transcript lines and periodically sends them to Ollama
+// Analyzer накапливает реплики и периодически обновляет карту игры через Ollama
 type Analyzer struct {
 	cfg    *config.Config
 	ollama *ollama.Client
 
-	buffer  []string // current pending lines (not yet sent)
-	history []string // full transcript history (for context window)
+	buffer  []string        // текущие реплики ещё не отправленные
+	gameMap *ollama.GameMap // накопительная карта игры
+	round   int             // номер текущего анализа
 }
 
 func New(cfg *config.Config, ollamaClient *ollama.Client) *Analyzer {
 	return &Analyzer{
-		cfg:    cfg,
-		ollama: ollamaClient,
+		cfg:     cfg,
+		ollama:  ollamaClient,
+		gameMap: &ollama.GameMap{},
 	}
 }
 
-// AddLine adds a transcribed line. When buffer is full, triggers analysis.
-// Returns AnalysisResult if analysis was triggered, nil otherwise.
-func (a *Analyzer) AddLine(ctx context.Context, line string) (*ollama.AnalysisResult, error) {
+// AddLine добавляет транскрибированную реплику.
+// Когда буфер заполнен — запускает анализ и обновляет карту игры.
+func (a *Analyzer) AddLine(ctx context.Context, line string) (*ollama.GameMap, error) {
 	a.buffer = append(a.buffer, line)
-	a.history = append(a.history, line)
 
 	if len(a.buffer) >= a.cfg.Analysis.BufferLines {
 		return a.flush(ctx)
@@ -38,93 +40,167 @@ func (a *Analyzer) AddLine(ctx context.Context, line string) (*ollama.AnalysisRe
 	return nil, nil
 }
 
-// Flush forces analysis even if buffer isn't full (call at end of file)
-func (a *Analyzer) Flush(ctx context.Context) (*ollama.AnalysisResult, error) {
+// Flush принудительно запускает анализ остатка буфера (вызывается в конце файла)
+func (a *Analyzer) Flush(ctx context.Context) (*ollama.GameMap, error) {
 	if len(a.buffer) == 0 {
 		return nil, nil
 	}
 	return a.flush(ctx)
 }
 
-func (a *Analyzer) flush(ctx context.Context) (*ollama.AnalysisResult, error) {
-	fragment := strings.Join(a.buffer, "\n")
+func (a *Analyzer) flush(ctx context.Context) (*ollama.GameMap, error) {
+	chunk := strings.Join(a.buffer, "\n")
 	a.buffer = nil
+	a.round++
 
-	userPrompt := fmt.Sprintf(a.cfg.Prompts.UserTemplate, fragment)
+	userPrompt := a.buildPrompt(chunk)
 
-	// append rolling context summary if we have history
-	if len(a.history) > a.cfg.Analysis.BufferLines {
-		contextLines := a.contextWindow()
-		userPrompt = fmt.Sprintf(
-			"Контекст игры (последние реплики):\n---\n%s\n---\n\n%s",
-			strings.Join(contextLines, "\n"),
-			userPrompt,
-		)
-	}
-
-	result, err := a.ollama.Analyze(ctx, a.cfg.Prompts.System, userPrompt)
+	gameMap, err := a.ollama.Analyze(ctx, a.cfg.Prompts.System, userPrompt)
 	if err != nil {
 		return nil, fmt.Errorf("ollama analyze: %w", err)
 	}
 
-	return result, nil
-}
-
-// contextWindow returns the last N lines of history (excluding current buffer)
-func (a *Analyzer) contextWindow() []string {
-	n := a.cfg.Analysis.ContextWindow
-	if len(a.history) <= n {
-		return a.history
+	// обновляем накопленную карту только если получили валидный ответ
+	if !gameMap.IsEmpty() {
+		a.gameMap = gameMap
 	}
-	return a.history[len(a.history)-n:]
+
+	return gameMap, nil
 }
 
-// Stats returns current buffer state for logging
-func (a *Analyzer) Stats() string {
-	return fmt.Sprintf("buffer=%d/%d history=%d",
-		len(a.buffer), a.cfg.Analysis.BufferLines, len(a.history))
-}
-
-// FormatResult pretty-prints the analysis result for stdout
-func FormatResult(result *ollama.AnalysisResult, elapsed time.Duration) string {
+// buildPrompt формирует промпт с текущей картой игры как контекстом
+func (a *Analyzer) buildPrompt(chunk string) string {
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("\n%s АНАЛИЗ (%.1fs) %s\n",
-		strings.Repeat("─", 20), elapsed.Seconds(), strings.Repeat("─", 20)))
-
-	if len(result.Suspicion) > 0 {
-		sb.WriteString("🎭 Подозрения:\n")
-		for _, s := range result.Suspicion {
-			bar := suspicionBar(s.Score)
-			sb.WriteString(fmt.Sprintf("  %-12s %s %d/10  %s\n",
-				s.Player, bar, s.Score, s.Reason))
-		}
+	if a.gameMap.IsEmpty() {
+		// первый чанк — карты ещё нет
+		sb.WriteString("Это начало игры. Карта игры пока пуста.\n\n")
+	} else {
+		// передаём текущую карту как контекст
+		sb.WriteString("ТЕКУЩАЯ КАРТА ИГРЫ (накоплено к этому моменту):\n")
+		sb.WriteString(a.gameMap.ToJSON())
+		sb.WriteString("\n\n")
 	}
 
-	if len(result.KeyPhrases) > 0 {
-		sb.WriteString(fmt.Sprintf("🔑 Ключевые фразы: %s\n",
-			strings.Join(result.KeyPhrases, " | ")))
-	}
+	sb.WriteString(fmt.Sprintf("НОВЫЙ ФРАГМЕНТ (раунд анализа #%d):\n", a.round))
+	sb.WriteString("---\n")
+	sb.WriteString(chunk)
+	sb.WriteString("\n---\n\n")
+	sb.WriteString(a.cfg.Prompts.UserTemplate)
 
-	if result.Summary != "" {
-		sb.WriteString(fmt.Sprintf("📝 Вывод: %s\n", result.Summary))
-	}
-
-	if len(result.Suspicion) == 0 && result.Summary == "" {
-		// JSON parse failed — show raw
-		sb.WriteString("⚠️  Сырой ответ модели:\n")
-		sb.WriteString(result.Raw)
-		sb.WriteString("\n")
-	}
-
-	sb.WriteString(strings.Repeat("─", 52) + "\n")
 	return sb.String()
 }
 
-func suspicionBar(score int) string {
-	filled := score
-	if filled > 10 {
-		filled = 10
+// CurrentGameMap возвращает текущую накопленную карту игры
+func (a *Analyzer) CurrentGameMap() *ollama.GameMap {
+	return a.gameMap
+}
+
+// Stats возвращает текущее состояние буфера для логирования
+func (a *Analyzer) Stats() string {
+	return fmt.Sprintf("buffer=%d/%d round=%d players=%d",
+		len(a.buffer), a.cfg.Analysis.BufferLines, a.round, len(a.gameMap.PlayerProfiles))
+}
+
+// FormatResult красиво выводит карту игры в stdout
+func FormatResult(gameMap *ollama.GameMap, round int, elapsed time.Duration) string {
+	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("\n%s АНАЛИЗ #%d (%.1fs) %s\n",
+		strings.Repeat("─", 15), round, elapsed.Seconds(), strings.Repeat("─", 15)))
+
+	if gameMap.GameFlow != "" {
+		sb.WriteString(fmt.Sprintf("📋 Ход игры: %s\n", gameMap.GameFlow))
 	}
-	return "[" + strings.Repeat("█", filled) + strings.Repeat("░", 10-filled) + "]"
+
+	if len(gameMap.PlayerProfiles) > 0 {
+		sb.WriteString("\n🎭 Карта игроков:\n")
+		for _, p := range gameMap.PlayerProfiles {
+			mafiaTag := "  "
+			if p.IsLikelyMafia {
+				mafiaTag = "🔴"
+			} else {
+				mafiaTag = "🟢"
+			}
+			aggrBar := aggressionBar(p.AggressionLevel)
+			sb.WriteString(fmt.Sprintf("  %s %-12s агрессия:%s %d/10\n",
+				mafiaTag, p.IdentifiedID, aggrBar, p.AggressionLevel))
+			if p.Suspicions != "" {
+				sb.WriteString(fmt.Sprintf("     подозревает: %s\n", p.Suspicions))
+			}
+			if p.Reasoning != "" {
+				sb.WriteString(fmt.Sprintf("     вывод: %s\n", p.Reasoning))
+			}
+		}
+	}
+
+	// если JSON не распарсился — показываем сырой ответ
+	if gameMap.IsEmpty() {
+		sb.WriteString("⚠️  Сырой ответ модели:\n")
+		sb.WriteString(gameMap.Raw)
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString(strings.Repeat("─", 47) + "\n")
+	return sb.String()
+}
+
+// FormatFinalMap выводит финальную карту игры в конце
+func FormatFinalMap(gameMap *ollama.GameMap) string {
+	if gameMap.IsEmpty() {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("\n%s ФИНАЛЬНАЯ КАРТА ИГРЫ %s\n",
+		strings.Repeat("═", 15), strings.Repeat("═", 15)))
+
+	sb.WriteString(fmt.Sprintf("📋 %s\n\n", gameMap.GameFlow))
+
+	mafia := []ollama.PlayerProfile{}
+	town := []ollama.PlayerProfile{}
+	for _, p := range gameMap.PlayerProfiles {
+		if p.IsLikelyMafia {
+			mafia = append(mafia, p)
+		} else {
+			town = append(town, p)
+		}
+	}
+
+	if len(mafia) > 0 {
+		sb.WriteString("🔴 Вероятная мафия:\n")
+		for _, p := range mafia {
+			sb.WriteString(fmt.Sprintf("   %-12s — %s\n", p.IdentifiedID, p.Reasoning))
+		}
+	}
+
+	if len(town) > 0 {
+		sb.WriteString("🟢 Мирные жители:\n")
+		for _, p := range town {
+			sb.WriteString(fmt.Sprintf("   %-12s — %s\n", p.IdentifiedID, p.Reasoning))
+		}
+	}
+
+	// финальный JSON для дебага / будущего фронтенда
+	sb.WriteString("\n📄 JSON:\n")
+	b, _ := json.MarshalIndent(gameMap, "", "  ")
+	sb.WriteString(string(b))
+	sb.WriteString("\n")
+	sb.WriteString(strings.Repeat("═", 51) + "\n")
+
+	return sb.String()
+}
+
+func aggressionBar(level int) string {
+	if level > 10 {
+		level = 10
+	}
+	return "[" + strings.Repeat("█", level) + strings.Repeat("░", 10-level) + "]"
+}
+
+// IsBufferFull возвращает true если добавление этой строки заполнит буфер
+// используется для логирования момента отправки в ollama
+func (a *Analyzer) IsBufferFull(nextLine string) bool {
+	_ = nextLine
+	return len(a.buffer)+1 >= a.cfg.Analysis.BufferLines
 }
