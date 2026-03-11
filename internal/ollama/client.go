@@ -14,13 +14,11 @@ import (
 	"mafia-analyzer/config"
 )
 
-// Message is a single chat message
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-// PlayerProfile описывает одного игрока в карте игры
 type PlayerProfile struct {
 	IdentifiedID    string `json:"identified_id"`
 	Suspicions      string `json:"suspicions"`
@@ -31,17 +29,18 @@ type PlayerProfile struct {
 
 // GameMap — накопительная карта игры, обновляется с каждым чанком
 type GameMap struct {
-	GameFlow       string          `json:"game_flow"`
-	PlayerProfiles []PlayerProfile `json:"player_profiles"`
-	Raw            string          `json:"-"` // полный сырой ответ модели
+	CurrentPhase      string          `json:"current_phase"`      // "день", "ночь", "переход"
+	DayNumber         int             `json:"day_number"`         // номер текущего дня
+	GameFlow          string          `json:"game_flow"`          // хронология событий
+	EliminatedPlayers []string        `json:"eliminated_players"` // выбывшие игроки
+	PlayerProfiles    []PlayerProfile `json:"player_profiles"`
+	Raw               string          `json:"-"`
 }
 
-// IsEmpty возвращает true если карта ещё не заполнена
 func (g *GameMap) IsEmpty() bool {
 	return g.GameFlow == "" && len(g.PlayerProfiles) == 0
 }
 
-// ToJSON сериализует карту в JSON строку для передачи в следующий промпт
 func (g *GameMap) ToJSON() string {
 	if g.IsEmpty() {
 		return "{}"
@@ -83,7 +82,6 @@ type streamChunk struct {
 	Done bool `json:"done"`
 }
 
-// Analyze отправляет промпт в Ollama и возвращает обновлённую карту игры
 func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (*GameMap, error) {
 	req := chatRequest{
 		Model: c.cfg.Model,
@@ -155,7 +153,6 @@ func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (
 	return gameMap, nil
 }
 
-// extractJSON вытаскивает JSON объект из строки с возможными markdown фенсами
 func extractJSON(s string) string {
 	if idx := strings.Index(s, "```json"); idx != -1 {
 		s = s[idx+7:]

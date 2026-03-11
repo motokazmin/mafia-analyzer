@@ -11,13 +11,11 @@ import (
 	"mafia-analyzer/config"
 )
 
-// Line represents a single transcribed line from whisper
 type Line struct {
 	Text string
 	Raw  string
 }
 
-// Runner manages the whisper subprocess
 type Runner struct {
 	cfg *config.WhisperConfig
 }
@@ -26,7 +24,6 @@ func NewRunner(cfg *config.WhisperConfig) *Runner {
 	return &Runner{cfg: cfg}
 }
 
-// TranscribeFile запускает whisper и читает строки по мере появления через StdoutPipe
 func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan Line, <-chan error) {
 	lines := make(chan Line, 32)
 	errc := make(chan error, 1)
@@ -50,6 +47,11 @@ func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan L
 			return
 		}
 
+		const maxRepeat = 3 // максимум одинаковых строк подряд
+
+		var lastText string
+		repeatCount := 0
+
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			raw := scanner.Text()
@@ -57,6 +59,20 @@ func (r *Runner) TranscribeFile(ctx context.Context, audioFile string) (<-chan L
 			if text == "" {
 				continue
 			}
+
+			// фильтруем зацикливание whisper
+			if text == lastText {
+				repeatCount++
+				if repeatCount >= maxRepeat {
+					// пропускаем но не сбрасываем счётчик —
+					// продолжаем игнорировать пока не придёт новый текст
+					continue
+				}
+			} else {
+				lastText = text
+				repeatCount = 1
+			}
+
 			select {
 			case lines <- Line{Text: text, Raw: raw}:
 			case <-ctx.Done():
@@ -84,8 +100,6 @@ func (r *Runner) buildArgs(audioFile string) []string {
 	return args
 }
 
-// cleanLine вырезает тайминги whisper и возвращает чистый текст
-// формат строки: [00:00:00.000 --> 00:00:05.000]   Текст сегмента
 func cleanLine(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -100,7 +114,7 @@ func cleanLine(s string) string {
 		}
 	}
 
-	// фильтруем оставшиеся служебные теги [BLANK_AUDIO] и т.д.
+	// фильтруем служебные теги [BLANK_AUDIO] и т.д.
 	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
 		return ""
 	}
