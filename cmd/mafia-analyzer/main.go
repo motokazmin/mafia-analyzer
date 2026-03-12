@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,10 +53,14 @@ func main() {
 	an := analyzer.New(cfg, ollamaClient)
 
 	logf(colorGray, "INIT", "checking ollama at %s ...", cfg.Ollama.BaseURL)
-	if err := checkOllama(cfg.Ollama.BaseURL); err != nil {
+	if err := checkOllama(&cfg.Ollama); err != nil {
 		logf(colorYellow, "WARN", "ollama check failed: %v", err)
 	} else {
-		logf(colorGreen, "INIT", "ollama OK — model: %s", cfg.Ollama.Model)
+		location := "локальный"
+		if cfg.Ollama.APIKey != "" || strings.HasPrefix(cfg.Ollama.BaseURL, "https://") {
+			location = "облачный"
+		}
+		logf(colorGreen, "INIT", "ollama OK (%s) — model: %s", location, cfg.Ollama.Model)
 	}
 
 	logf(colorGreen, "START", "launching whisper on: %s", *audioFile)
@@ -144,13 +149,39 @@ func fatalf(format string, args ...any) {
 	os.Exit(1)
 }
 
-func checkOllama(baseURL string) error {
+func checkOllama(cfg *config.OllamaConfig) error {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(baseURL + "/api/tags")
+
+	// Нормализуем URL (убираем лишние слэши)
+	baseURL := strings.TrimRight(cfg.BaseURL, "/")
+	apiURL := baseURL + "/api/tags"
+
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+
+	// Добавляем API ключ, если указан
+	if cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	}
+
+	// Автоматически добавляем заголовок для ngrok-free.dev
+	if strings.Contains(baseURL, "ngrok-free.dev") {
+		req.Header.Set("ngrok-skip-browser-warning", "true")
+	}
+
+	// Добавляем кастомные заголовки
+	for key, value := range cfg.Headers {
+		req.Header.Set(key, value)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}

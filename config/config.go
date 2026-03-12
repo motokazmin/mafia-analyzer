@@ -21,10 +21,12 @@ type WhisperConfig struct {
 }
 
 type OllamaConfig struct {
-	BaseURL     string  `json:"base_url"`
-	Model       string  `json:"model"`
-	Temperature float64 `json:"temperature"`
-	Stream      bool    `json:"stream"`
+	BaseURL     string            `json:"base_url"`      // URL Ollama сервера (локальный или облачный)
+	Model       string            `json:"model"`         // Название модели
+	Temperature float64          `json:"temperature"`   // Температура генерации
+	Stream      bool              `json:"stream"`        // Использовать стриминг
+	APIKey      string            `json:"api_key"`       // API ключ для облачных сервисов (опционально)
+	Headers     map[string]string `json:"headers"`      // Дополнительные HTTP заголовки (опционально)
 }
 
 type AnalysisConfig struct {

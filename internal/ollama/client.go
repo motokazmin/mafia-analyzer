@@ -61,7 +61,9 @@ func NewClient(cfg *config.OllamaConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			// Увеличенный таймаут, т.к. большие модели (например, qwen2.5:14b)
+			// на холодном старте через Colab/ngrok могут отвечать дольше 2 минут.
+			Timeout: 600 * time.Second,
 		},
 	}
 }
@@ -98,12 +100,30 @@ func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST",
-		c.cfg.BaseURL+"/api/chat", bytes.NewReader(body))
+	// Нормализуем URL (убираем лишние слэши)
+	baseURL := strings.TrimRight(c.cfg.BaseURL, "/")
+	apiURL := baseURL + "/api/chat"
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+
+	// Добавляем API ключ, если указан (для облачных сервисов)
+	if c.cfg.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
+
+	// Автоматически добавляем заголовок для ngrok-free.dev
+	if strings.Contains(baseURL, "ngrok-free.dev") {
+		httpReq.Header.Set("ngrok-skip-browser-warning", "true")
+	}
+
+	// Добавляем кастомные заголовки, если указаны
+	for key, value := range c.cfg.Headers {
+		httpReq.Header.Set(key, value)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
