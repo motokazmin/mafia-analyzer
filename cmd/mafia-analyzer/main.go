@@ -4,9 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,11 +27,19 @@ const (
 
 func main() {
 	configPath := flag.String("config", "config/config.json", "path to config file")
-	audioFile := flag.String("audio", "", "audio file to transcribe (required)")
+	audioFile := flag.String("audio", "", "audio file to transcribe")
+	useMic := flag.Bool("mic", false, "capture audio from microphone (requires remote whisper)")
 	flag.Parse()
 
-	if *audioFile == "" {
-		fmt.Fprintf(os.Stderr, "Usage: mafia-analyzer -audio <file> [-config <config.json>]\n")
+	if *audioFile == "" && !*useMic {
+		fmt.Fprintf(os.Stderr, "Usage:\n")
+		fmt.Fprintf(os.Stderr, "  mafia-analyzer -audio <file> [-config <config.json>]\n")
+		fmt.Fprintf(os.Stderr, "  mafia-analyzer -mic [-config <config.json>]\n")
+		os.Exit(1)
+	}
+
+	if *audioFile != "" && *useMic {
+		fmt.Fprintf(os.Stderr, "Error: cannot use both -audio and -mic flags\n")
 		os.Exit(1)
 	}
 
@@ -42,7 +50,13 @@ func main() {
 
 	logf(colorCyan, "CONFIG", "model=%s | buffer=%d lines | context=%d lines",
 		cfg.Ollama.Model, cfg.Analysis.BufferLines, cfg.Analysis.ContextWindow)
-	logf(colorCyan, "CONFIG", "whisper=%s | lang=%s", cfg.Whisper.Binary, cfg.Whisper.Language)
+
+	if *useMic {
+		logf(colorCyan, "CONFIG", "whisper=microphone (remote) | lang=%s | chunk=%ds",
+			cfg.Whisper.Language, cfg.Whisper.Microphone.ChunkSec)
+	} else {
+		logf(colorCyan, "CONFIG", "whisper=%s | lang=%s", cfg.Whisper.Binary, cfg.Whisper.Language)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -52,14 +66,30 @@ func main() {
 	an := analyzer.New(cfg, ollamaClient)
 
 	logf(colorGray, "INIT", "checking ollama at %s ...", cfg.Ollama.BaseURL)
-	if err := checkOllama(cfg.Ollama.BaseURL); err != nil {
+	if err := ollamaClient.Check(); err != nil {
 		logf(colorYellow, "WARN", "ollama check failed: %v", err)
 	} else {
-		logf(colorGreen, "INIT", "ollama OK — model: %s", cfg.Ollama.Model)
+		location := "локальный"
+		if cfg.Ollama.APIKey != "" || strings.HasPrefix(cfg.Ollama.BaseURL, "https://") {
+			location = "облачный"
+		}
+		logf(colorGreen, "INIT", "ollama OK (%s) — model: %s", location, cfg.Ollama.Model)
 	}
 
-	logf(colorGreen, "START", "launching whisper on: %s", *audioFile)
-	lines, errc := whisperRunner.TranscribeFile(ctx, *audioFile)
+	var lines <-chan whisper.Line
+	var errc <-chan error
+
+	if *useMic {
+		if cfg.Whisper.RemoteURL == "" {
+			fatalf("microphone mode requires remote_url in config.whisper")
+		}
+		logf(colorGreen, "START", "capturing microphone (chunk: %ds, device: %s)",
+			cfg.Whisper.Microphone.ChunkSec, cfg.Whisper.Microphone.Device)
+		lines, errc = whisperRunner.TranscribeMicrophone(ctx)
+	} else {
+		logf(colorGreen, "START", "launching whisper on: %s", *audioFile)
+		lines, errc = whisperRunner.TranscribeFile(ctx, *audioFile)
+	}
 
 	totalLines := 0
 	totalAnalyses := 0
@@ -110,12 +140,15 @@ loop:
 		}
 	}
 
-	// финальный flush остатка буфера
-	if ctx.Err() == nil {
+	// финальный flush остатка буфера — всегда, даже после Ctrl+C
+	{
 		logf(colorCyan, "FLUSH", "finalizing... %s", an.Stats())
 		logf(colorYellow, "OLLAMA", "→ sending final chunk to ollama")
+		// Используем отдельный контекст: основной уже может быть отменён (Ctrl+C)
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer flushCancel()
 		t0 := time.Now()
-		gameMap, err := an.Flush(ctx)
+		gameMap, err := an.Flush(flushCtx)
 		if err != nil {
 			logf(colorRed, "ERROR", "final flush: %v", err)
 		} else if gameMap != nil {
@@ -142,17 +175,4 @@ func logf(color, tag, format string, args ...any) {
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "FATAL: "+format+"\n", args...)
 	os.Exit(1)
-}
-
-func checkOllama(baseURL string) error {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(baseURL + "/api/tags")
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	return nil
 }

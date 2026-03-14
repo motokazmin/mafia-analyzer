@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"mafia-analyzer/config"
@@ -14,6 +15,7 @@ import (
 type Analyzer struct {
 	cfg     *config.Config
 	ollama  *ollama.Client
+	mu      sync.Mutex // защищает buffer, gameMap, round
 	buffer  []string
 	gameMap *ollama.GameMap
 	round   int
@@ -28,26 +30,38 @@ func New(cfg *config.Config, ollamaClient *ollama.Client) *Analyzer {
 }
 
 func (a *Analyzer) AddLine(ctx context.Context, line string) (*ollama.GameMap, error) {
+	a.mu.Lock()
 	a.buffer = append(a.buffer, line)
-	if len(a.buffer) >= a.cfg.Analysis.BufferLines {
+	full := len(a.buffer) >= a.cfg.Analysis.BufferLines
+	a.mu.Unlock()
+
+	if full {
 		return a.flush(ctx)
 	}
 	return nil, nil
 }
 
 func (a *Analyzer) Flush(ctx context.Context) (*ollama.GameMap, error) {
-	if len(a.buffer) == 0 {
+	a.mu.Lock()
+	empty := len(a.buffer) == 0
+	a.mu.Unlock()
+
+	if empty {
 		return nil, nil
 	}
 	return a.flush(ctx)
 }
 
 func (a *Analyzer) flush(ctx context.Context) (*ollama.GameMap, error) {
+	a.mu.Lock()
 	chunk := strings.Join(a.buffer, "\n")
 	a.buffer = nil
 	a.round++
+	a.mu.Unlock()
 
+	a.mu.Lock()
 	userPrompt := a.buildPrompt(chunk)
+	a.mu.Unlock()
 
 	gameMap, err := a.ollama.Analyze(ctx, a.cfg.Prompts.System, userPrompt)
 	if err != nil {
@@ -55,13 +69,16 @@ func (a *Analyzer) flush(ctx context.Context) (*ollama.GameMap, error) {
 	}
 
 	if !gameMap.IsEmpty() {
+		a.mu.Lock()
 		a.gameMap = gameMap
+		a.mu.Unlock()
 	}
 
 	return gameMap, nil
 }
 
 func (a *Analyzer) buildPrompt(chunk string) string {
+	// вызывается под mu.Lock() из flush
 	var gameMapStr string
 	if a.gameMap.IsEmpty() {
 		gameMapStr = "Карта пуста — это начало игры."
@@ -72,22 +89,31 @@ func (a *Analyzer) buildPrompt(chunk string) string {
 }
 
 func (a *Analyzer) CurrentGameMap() *ollama.GameMap {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.gameMap
 }
 
 func (a *Analyzer) IsBufferFull(nextLine string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	_ = nextLine
 	return len(a.buffer)+1 >= a.cfg.Analysis.BufferLines
 }
 
 func (a *Analyzer) Stats() string {
+	a.mu.Lock()
+	bufLen := len(a.buffer)
+	round := a.round
 	phase := a.gameMap.CurrentPhase
+	players := len(a.gameMap.PlayerProfiles)
+	a.mu.Unlock()
+
 	if phase == "" {
 		phase = "неизвестно"
 	}
 	return fmt.Sprintf("buffer=%d/%d round=%d players=%d phase=%s",
-		len(a.buffer), a.cfg.Analysis.BufferLines, a.round,
-		len(a.gameMap.PlayerProfiles), phase)
+		bufLen, a.cfg.Analysis.BufferLines, round, players, phase)
 }
 
 // FormatResult выводит карту игры в stdout
