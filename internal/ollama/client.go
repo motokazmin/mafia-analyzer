@@ -61,11 +61,57 @@ func NewClient(cfg *config.OllamaConfig) *Client {
 	return &Client{
 		cfg: cfg,
 		httpClient: &http.Client{
-			// Увеличенный таймаут, т.к. большие модели (например, qwen2.5:14b)
-			// на холодном старте через Colab/ngrok могут отвечать дольше 2 минут.
+			// Увеличенный таймаут: большие модели (qwen2.5:14b) через Colab/ngrok
+			// на холодном старте могут отвечать дольше 2 минут.
 			Timeout: 600 * time.Second,
 		},
 	}
+}
+
+// newRequest создаёт HTTP-запрос с общими заголовками: Authorization, ngrok, кастомные.
+// Единственное место, где выставляются заголовки — нет дублирования.
+func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error) {
+	baseURL := strings.TrimRight(c.cfg.BaseURL, "/")
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.cfg.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
+	}
+	// ngrok выставляет браузерное предупреждение на всех своих доменах
+	// (.ngrok-free.app, .ngrok-free.dev, .ngrok.io и др.) — ловим по общей подстроке
+	if strings.Contains(baseURL, ".ngrok") {
+		req.Header.Set("ngrok-skip-browser-warning", "true")
+	}
+	for k, v := range c.cfg.Headers {
+		req.Header.Set(k, v)
+	}
+	return req, nil
+}
+
+// Check проверяет доступность Ollama через GET /api/tags.
+// Использует короткий таймаут, не зависит от основного httpClient.
+func (c *Client) Check() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := c.newRequest(ctx, "GET", "/api/tags", nil)
+	if err != nil {
+		return err
+	}
+
+	checkClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := checkClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil
 }
 
 type chatRequest struct {
@@ -100,30 +146,11 @@ func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	// Нормализуем URL (убираем лишние слэши)
-	baseURL := strings.TrimRight(c.cfg.BaseURL, "/")
-	apiURL := baseURL + "/api/chat"
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(body))
+	httpReq, err := c.newRequest(ctx, "POST", "/api/chat", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-
-	// Добавляем API ключ, если указан (для облачных сервисов)
-	if c.cfg.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
-	}
-
-	// Автоматически добавляем заголовок для ngrok-free.dev
-	if strings.Contains(baseURL, "ngrok-free.dev") {
-		httpReq.Header.Set("ngrok-skip-browser-warning", "true")
-	}
-
-	// Добавляем кастомные заголовки, если указаны
-	for key, value := range c.cfg.Headers {
-		httpReq.Header.Set(key, value)
-	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
@@ -173,7 +200,11 @@ func (c *Client) Analyze(ctx context.Context, systemPrompt, userPrompt string) (
 	return gameMap, nil
 }
 
+// extractJSON вырезает первый корректный JSON-объект из строки.
+// Считает глубину скобок, поэтому не ломается на тексте вокруг JSON
+// и на вложенных объектах.
 func extractJSON(s string) string {
+	// Снимаем markdown-ограждение ```json ... ``` или ``` ... ```
 	if idx := strings.Index(s, "```json"); idx != -1 {
 		s = s[idx+7:]
 		if end := strings.Index(s, "```"); end != -1 {
@@ -188,9 +219,41 @@ func extractJSON(s string) string {
 	s = strings.TrimSpace(s)
 
 	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start == -1 || end == -1 || end <= start {
+	if start == -1 {
 		return ""
 	}
-	return s[start : end+1]
+
+	// Считаем скобки вместо LastIndex — корректно обрабатывает
+	// текст после JSON и вложенные объекты
+	depth := 0
+	inString := false
+	escape := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if escape {
+			escape = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escape = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		switch ch {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }

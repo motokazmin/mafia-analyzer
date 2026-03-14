@@ -1,7 +1,8 @@
 {
   "whisper": {
+    "mode": "remote",
     "binary": "/home/roman/github/whisper.cpp/build/bin/whisper-cli",
-    "model": "/home/roman/github/whisper.cpp/models/ggml-small.bin",
+    "model": "/home/roman/github/whisper.cpp/models/ggml-medium.bin",
     "language": "ru",
     "extra_args": [
       "--no-prints",
@@ -11,11 +12,20 @@
       "--best-of", "5",
       "--no-fallback",
       "--prompt", "Игра мафия. Игроки обсуждают кто мафия. Ведущий объявляет день и ночь."
-    ]
+    ],
+    "remote_url": "https://gregoria-unpacified-kendra.ngrok-free.dev/whisper/file",
+    "microphone": {
+      "device": "default",
+      "sample_rate": 16000,
+      "channels": 1,
+      "chunk_sec": 15,
+      "format": "wav",
+      "ffmpeg_path": "ffmpeg"
+    }
   },
   "ollama": {
     "base_url": "https://gregoria-unpacified-kendra.ngrok-free.dev",
-    "model": "qwen2.5:14b",
+    "model": "gemma3:12b",
     "temperature": 0.2,
     "stream": true,
     "api_key": "",

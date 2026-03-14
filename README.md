@@ -87,6 +87,61 @@ ollama pull llama3.1   # или любая другая модель
 # Следуйте инструкциям в scripts/README_COLAB.md
 ```
 
+#### Облачный Whisper (Google Colab)
+
+Для работы с облачным Whisper через Google Colab:
+
+1. Запустите скрипт `scripts/setup_whisper_colab.py` в Colab
+2. Скопируйте публичный ngrok URL
+3. Обновите конфиг:
+
+```json
+{
+  "whisper": {
+    "mode": "remote",
+    "remote_url": "https://your-ngrok-url.ngrok-free.dev/whisper/file",
+    "language": "ru",
+    "model": "ggml-small"
+  }
+}
+```
+
+#### Захват микрофона
+
+Для работы с микрофоном в реальном времени:
+
+1. Убедитесь, что `ffmpeg` установлен: `sudo apt install ffmpeg` (Linux)
+2. Настройте облачный Whisper (см. выше)
+3. Обновите конфиг:
+
+```json
+{
+  "whisper": {
+    "mode": "remote",
+    "remote_url": "https://your-ngrok-url.ngrok-free.dev/whisper/file",
+    "microphone": {
+      "device": "default",
+      "sample_rate": 16000,
+      "channels": 1,
+      "chunk_sec": 5,
+      "format": "wav",
+      "ffmpeg_path": "ffmpeg"
+    }
+  }
+}
+```
+
+4. Запустите с флагом `-mic`:
+
+```bash
+./mafia-analyzer -mic -config config/config.json
+```
+
+**Примечания:**
+- На Linux используйте `device: "default"` (PulseAudio)
+- На macOS используйте `device: ":0"` (avfoundation)
+- На Windows используйте `device: "audio=Microphone"` (dshow)
+
 Промпты редактируются там же в `prompts.system` — они уже настроены на JSON-ответ.
 
 ### 3. Сборка
@@ -95,7 +150,9 @@ ollama pull llama3.1   # или любая другая модель
 go build -o mafia-analyzer ./cmd/mafia-analyzer/
 ```
 
-### 4. Запуск с аудио файлом
+### 4. Запуск
+
+#### С аудио файлом
 
 ```bash
 # Прямой режим (проще для теста):
@@ -103,6 +160,12 @@ go build -o mafia-analyzer ./cmd/mafia-analyzer/
 
 # С кастомным конфигом:
 ./mafia-analyzer -audio game_recording.wav -config config/config.json
+```
+
+#### С микрофоном (требует облачный Whisper)
+
+```bash
+./mafia-analyzer -mic -config config/config.microphone.example.json
 ```
 
 ### 5. Тест через VLC (симуляция стрима)
@@ -145,6 +208,7 @@ mafia-analyzer/
 │   └── config.cloud.example.json   # пример облачной конфигурации
 ├── scripts/
 │   ├── setup_ollama_colab.py       # скрипт развертывания Ollama в Colab
+│   ├── setup_whisper_colab.py      # скрипт развертывания Whisper в Colab
 │   ├── diagnose_colab.py           # диагностика проблем с Ollama/ngrok
 │   └── README_COLAB.md             # инструкции по использованию Colab
 └── test-with-vlc.sh                # пайп через VLC для симуляции стрима
