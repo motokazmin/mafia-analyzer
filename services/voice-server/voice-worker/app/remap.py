@@ -70,7 +70,8 @@ def remap_speakers(
     order: OrderMode = "temporal",
 ) -> list:
     def match_fn(emb: np.ndarray):
-        return registry.match_or_register(emb)
+        p, _ = registry.match_or_register(emb)
+        return p
 
     flush_pending(registry, sample_rate, run_wavlm, match_fn)
 
@@ -98,16 +99,17 @@ def remap_speakers(
             emb = run_wavlm(chunk, sample_rate)
             if emb is None:
                 continue
-            profile = registry.match_or_register(emb)
-            seg_to_profile[idx] = profile
+            profile, sim = registry.match_or_register(emb)
+            seg_to_profile[idx] = (profile, float(sim))
         else:
             rough_emb = run_wavlm(chunk, sample_rate)
             add_to_pending(registry, [chunk], dur, rough_emb)
 
     for idx, seg in enumerate(segments):
         if idx in seg_to_profile:
-            p = seg_to_profile[idx]
+            p, sim = seg_to_profile[idx]
             seg["speaker"] = p.display_name
             seg["voice_id"] = p.voice_id
+            seg["match_score"] = sim
 
     return segments

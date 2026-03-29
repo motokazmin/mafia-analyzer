@@ -29,6 +29,24 @@ func New(baseURL, apiKey string) *Client {
 	}
 }
 
+func (c *Client) WipeVoices() error {
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/voices/wipe", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-API-Key", c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("wipe voices: status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
 func (c *Client) Reset() error {
 	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/reset", nil)
 	if err != nil {
@@ -74,6 +92,56 @@ func (c *Client) ListVoices() (body []byte, status int, err error) {
 	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	return b, resp.StatusCode, err
+}
+
+func (c *Client) MergeVoices(sourceID, targetID string) error {
+	payload, err := json.Marshal(map[string]string{
+		"source_id": sourceID,
+		"target_id": targetID,
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/voices/merge", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("merge: status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func (c *Client) SetVoiceFlags(voiceID string, unreliable bool) error {
+	payload, err := json.Marshal(map[string]bool{"unreliable": unreliable})
+	if err != nil {
+		return err
+	}
+	u := c.BaseURL + "/voices/" + url.PathEscape(voiceID) + "/flags"
+	req, err := http.NewRequest(http.MethodPatch, u, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", c.APIKey)
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("flags: status %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
 }
 
 func (c *Client) LabelVoice(voiceID, displayName string) error {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -51,15 +52,17 @@ type SessionRow struct {
 
 // SegmentRow — реплика в БД.
 type SegmentRow struct {
-	ID        int64   `json:"id"`
-	SessionID string  `json:"session_id"`
-	Seq       int     `json:"seq"`
-	Speaker   string  `json:"speaker"`
-	VoiceID   string  `json:"voice_id,omitempty"`
-	Text      string  `json:"text"`
-	AbsStart  float64 `json:"abs_start"`
-	AbsEnd    float64 `json:"abs_end"`
-	WallTime  string  `json:"wall_time"`
+	ID              int64    `json:"id"`
+	SessionID       string   `json:"session_id"`
+	Seq             int      `json:"seq"`
+	Speaker         string   `json:"speaker"`
+	VoiceID         string   `json:"voice_id,omitempty"`
+	Text            string   `json:"text"`
+	AbsStart        float64  `json:"abs_start"`
+	AbsEnd          float64  `json:"abs_end"`
+	WallTime        string   `json:"wall_time"`
+	MatchScore      *float64 `json:"match_score,omitempty"`
+	OverrideApplied bool     `json:"override_applied,omitempty"`
 }
 
 // Store — SQLite: партии и реплики (отдельно от реестра голосов на Python).
@@ -115,6 +118,29 @@ CREATE TABLE IF NOT EXISTS game_segments (
 );
 CREATE INDEX IF NOT EXISTS idx_game_segments_session ON game_segments(session_id);
 `)
+	if err != nil {
+		return err
+	}
+	return s.migrateV2()
+}
+
+func (s *Store) migrateV2() error {
+	if _, err := s.db.Exec(`ALTER TABLE game_segments ADD COLUMN match_score REAL`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return err
+		}
+	}
+	_, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS game_segment_overrides (
+	session_id TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+	seq INTEGER NOT NULL,
+	speaker TEXT NOT NULL,
+	voice_id TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_seg_overrides_session ON game_segment_overrides(session_id);
+`)
 	return err
 }
 
@@ -160,10 +186,44 @@ func (s *Store) InsertSegment(sessionID string, seq int, seg domain.Segment, wal
 	if seg.VoiceID != "" {
 		vid = seg.VoiceID
 	}
+	var ms interface{}
+	if seg.MatchScore != nil {
+		ms = *seg.MatchScore
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO game_segments (session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, seq, seg.Speaker, vid, seg.Text, seg.AbsStart, seg.AbsEnd, wallTime,
+		`INSERT INTO game_segments (session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time, match_score)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sessionID, seq, seg.Speaker, vid, seg.Text, seg.AbsStart, seg.AbsEnd, wallTime, ms,
+	)
+	return err
+}
+
+// UpsertSegmentOverride — ручное назначение спикера для реплики (seq в рамках партии).
+func (s *Store) UpsertSegmentOverride(sessionID string, seq int, speaker, voiceID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := s.db.Exec(`
+		INSERT INTO game_segment_overrides (session_id, seq, speaker, voice_id, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(session_id, seq) DO UPDATE SET
+			speaker = excluded.speaker,
+			voice_id = excluded.voice_id,
+			updated_at = excluded.updated_at`,
+		sessionID, seq, speaker, voiceID, now,
+	)
+	return err
+}
+
+// DeleteSegmentOverride снимает ручное назначение.
+func (s *Store) DeleteSegmentOverride(sessionID string, seq int) error {
+	if sessionID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(
+		`DELETE FROM game_segment_overrides WHERE session_id = ? AND seq = ?`,
+		sessionID, seq,
 	)
 	return err
 }
@@ -253,10 +313,14 @@ func (s *Store) GetSession(id string) (*SessionRow, error) {
 	return &r, nil
 }
 
-// ListSegments возвращает все реплики партии по порядку seq.
+// ListSegments возвращает все реплики партии по порядку seq (с учётом переопределений).
 func (s *Store) ListSegments(sessionID string) ([]SegmentRow, error) {
+	ov, err := s.loadOverridesMap(sessionID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.Query(`
-		SELECT id, session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time
+		SELECT id, session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time, match_score
 		FROM game_segments WHERE session_id = ? ORDER BY seq ASC`, sessionID)
 	if err != nil {
 		return nil, err
@@ -266,13 +330,68 @@ func (s *Store) ListSegments(sessionID string) ([]SegmentRow, error) {
 	for rows.Next() {
 		var r SegmentRow
 		var vid sql.NullString
-		if err := rows.Scan(&r.ID, &r.SessionID, &r.Seq, &r.Speaker, &vid, &r.Text, &r.AbsStart, &r.AbsEnd, &r.WallTime); err != nil {
+		var ms sql.NullFloat64
+		if err := rows.Scan(&r.ID, &r.SessionID, &r.Seq, &r.Speaker, &vid, &r.Text, &r.AbsStart, &r.AbsEnd, &r.WallTime, &ms); err != nil {
 			return nil, err
 		}
 		if vid.Valid {
 			r.VoiceID = vid.String
 		}
+		if ms.Valid {
+			v := ms.Float64
+			r.MatchScore = &v
+		}
+		if o, ok := ov[r.Seq]; ok {
+			r.Speaker = o.speaker
+			r.VoiceID = o.voiceID
+			r.OverrideApplied = true
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+type overrideRow struct {
+	speaker  string
+	voiceID  string
+}
+
+func (s *Store) loadOverridesMap(sessionID string) (map[int]overrideRow, error) {
+	m := make(map[int]overrideRow)
+	rows, err := s.db.Query(
+		`SELECT seq, speaker, voice_id FROM game_segment_overrides WHERE session_id = ?`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var spk, vid string
+		if err := rows.Scan(&seq, &spk, &vid); err != nil {
+			return nil, err
+		}
+		m[seq] = overrideRow{speaker: spk, voiceID: vid}
+	}
+	return m, rows.Err()
+}
+
+// WipeAll удаляет все партии, реплики и переопределения (локальный журнал gateway).
+func (s *Store) WipeAll() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM game_segment_overrides`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM game_segments`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM game_sessions`); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }

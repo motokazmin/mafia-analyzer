@@ -54,15 +54,19 @@ Gateway сохраняет реплики в SQLite рядом с бинарни
 - **`capture_source`**: `file` (любой загруженный/прогнанный файл) или `microphone` (живая запись);
 - **`session_mode`**: `ingest` | `file` | `record` — уточняет сценарий;
 - **`source_filename`**: имя файла, если известно;
-- таблица **`game_segments`**: спикер, текст, тайминги, `voice_id`, порядок.
+- таблица **`game_segments`**: спикер, текст, тайминги, `voice_id`, `match_score` (уверенность по эмбеддингу), порядок `seq`;
+- таблица **`game_segment_overrides`** — ручное переназначение спикера для реплики (см. UI, кнопка ✎ у строки).
 
 HTTP (для выгрузки / своих скриптов анализа):
 
 - `GET /api/games/sessions?limit=100` — список партий;
 - `GET /api/games/sessions/{id}` — метаданные партии;
-- `GET /api/games/sessions/{id}/segments` — все реплики по порядку.
+- `GET /api/games/sessions/{id}/segments` — все реплики по порядку (учтены переопределения);
+- `POST` / `DELETE` `.../sessions/{id}/segments/{seq}/override` — ручное назначение / сброс.
 
-В ответах `POST /api/ingest`, `POST /api/session/start` и в `GET /api/session/status` при активной партии может быть поле **`game_session_id`**.
+В ответах `POST /api/ingest`, `POST /api/session/start` и в `GET /api/session/status` при активной партии может быть поле **`game_session_id`**, в статусе — **`source_filename`** (имя файла для ingest/file).
+
+**Полный сброс данных** (журнал партий на gateway + все голоса в Python): `POST /api/data/reset` с телом `{"confirm": true}` (сессия должна быть остановлена) или кнопка «Очистить базы» в UI. Только реестр голосов на Python: `POST /voices/wipe` с заголовком `X-API-Key`.
 
 Сборка:
 
@@ -78,10 +82,25 @@ go build -o bin/gateway ./cmd/gateway
 3. На локальной машине:  
    `go run ./cmd/gateway -voice-url=https://xxxx.ngrok-free.app`
 
-## 4. База данных
+## 4. Базы данных (две независимые SQLite)
 
-SQLite создаётся при первом обращении: по умолчанию **`voice-worker/data/voice_registry.sqlite`**.  
-Переопределение: переменная окружения **`VOICE_SERVER_DB`** (абсолютный путь к файлу).
+| Роль | Файл по умолчанию | Переопределение |
+|------|-------------------|-----------------|
+| **Партии и реплики** (gateway) | `data/game_log.sqlite` рядом с корнем модуля `voice-server` | Флаг **`-game-db`** |
+| **Реестр голосов** (voice-worker) | `voice-worker/data/voice_registry.sqlite` | **`VOICE_SERVER_DB`** |
+
+См. также [ARCHITECTURE.md](ARCHITECTURE.md).
+
+### Voice-worker: пороги и пресеты
+
+В окружении Python (не в Go): **`VOICE_THRESHOLD_PRESET`** — `balanced` (по умолчанию), **`strict`** (меньше слияний разных людей, больше новых ID), **`loose`**. Отдельные **`THRESHOLD_*`** в env переопределяют числа.
+
+### Прочие API voice-worker (через gateway)
+
+- `POST /api/speakers/merge` — объединить два профиля;
+- `PATCH /api/speakers/{id}/flags` — пометить «ненадёжный» кластер.
+
+Полный список: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## 5. Независимость от монорепозитория
 

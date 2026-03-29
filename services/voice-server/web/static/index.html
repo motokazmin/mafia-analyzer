@@ -22,8 +22,12 @@
       <span class="status-dot" id="statusDot" data-state="idle"></span>
       <span id="statusText">Ожидание</span>
       <span class="source-file" id="sourceFileLabel" hidden></span>
+      <span class="log-restore-hint" id="logRestoreHint" hidden></span>
     </div>
     <button type="button" id="btnSaveLog">Сохранить лог</button>
+    <button type="button" id="btnWipeData" class="btn-danger" title="Удалить все партии (gateway) и все голоса (voice-worker). Gateway: data/game_log.sqlite; голоса: voice-worker/data или VOICE_SERVER_DB / Google Drive в Colab.">
+      Очистить базы
+    </button>
   </header>
 
   <div class="layout">
@@ -43,6 +47,19 @@
     <div class="label-new">
       <input type="text" id="labelNewInput" placeholder="Новое имя">
       <button type="button" id="labelOk">OK</button>
+    </div>
+  </div>
+
+  <div id="reassignPopup" class="label-popup is-hidden" role="dialog">
+    <div class="label-popup-title">Переназначить реплику</div>
+    <label>Голос из реестра</label>
+    <select id="reassignSelect"></select>
+    <div class="label-new">
+      <input type="text" id="reassignNameInput" placeholder="или введите имя вручную">
+    </div>
+    <div class="label-new reassign-actions">
+      <button type="button" id="reassignOk">OK</button>
+      <button type="button" id="reassignClear" class="btn-muted">Сбросить</button>
     </div>
   </div>
 

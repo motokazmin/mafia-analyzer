@@ -87,9 +87,13 @@ func (m *Manager) onSegment(gameID string) func(domain.Segment) {
 			"abs_start": s.AbsStart,
 			"abs_end":   s.AbsEnd,
 			"ts":        wall,
+			"seq":       seq,
 		}
 		if s.VoiceID != "" {
 			msg["voice_id"] = s.VoiceID
+		}
+		if s.MatchScore != nil {
+			msg["match_score"] = *s.MatchScore
 		}
 		if gameID != "" {
 			msg["game_session_id"] = gameID

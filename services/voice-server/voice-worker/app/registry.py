@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import numpy as np
 
@@ -73,7 +73,8 @@ class VoiceRegistry:
             segment_count_delta=1,
         )
 
-    def match_or_register(self, embedding: np.ndarray) -> SpeakerProfile:
+    def match_or_register(self, embedding: np.ndarray) -> Tuple[SpeakerProfile, float]:
+        """Возвращает профиль и лучшую косинусную близость к существующим центроидам (до решения)."""
         emb = np.asarray(embedding, dtype=np.float64)
         best_profile: Optional[SpeakerProfile] = None
         best_sim = -1.0
@@ -90,27 +91,30 @@ class VoiceRegistry:
         ):
             best_profile.update(emb, best_sim)
             self.persist_centroid(best_profile)
-            return best_profile
+            return best_profile, float(best_sim)
 
         if config.THRESHOLD_SOFT_MATCH <= best_sim < config.THRESHOLD_CONFIDENT_MATCH:
             if calibration:
-                return self.register_new(emb)
+                p = self.register_new(emb)
+                return p, float(best_sim)
             assert best_profile is not None
             best_profile.soft_assign(emb)
-            return best_profile
+            return best_profile, float(best_sim)
 
         if best_sim < config.THRESHOLD_FORCE_NEW:
             if self._extra_slots_available():
-                return self.register_new(emb)
+                p = self.register_new(emb)
+                return p, float(best_sim)
             assert best_profile is not None
             best_profile.soft_assign(emb)
-            return best_profile
+            return best_profile, float(best_sim)
 
         if calibration:
-            return self.register_new(emb)
+            p = self.register_new(emb)
+            return p, float(best_sim)
         assert best_profile is not None
         best_profile.soft_assign(emb)
-        return best_profile
+        return best_profile, float(best_sim)
 
     def set_display_name(self, voice_id: str, name: str) -> bool:
         if not self.store.set_display_name(voice_id, name):

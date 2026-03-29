@@ -116,6 +116,11 @@ class VoiceInfo(BaseModel):
     voice_id: str
     display_name: Optional[str]
     segment_count: int
+    unreliable: bool = False
+
+
+class VoiceFlagsBody(BaseModel):
+    unreliable: bool
 
 
 class MergeBody(BaseModel):
@@ -129,6 +134,18 @@ class RenameBody(BaseModel):
 
 @app.get("/health")
 def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/voices/wipe")
+async def wipe_voices(x_api_key: str = Header(...)) -> dict[str, str]:
+    """Полностью очистить SQLite реестра голосов (эксперименты)."""
+    check_api_key(x_api_key)
+    store = get_registry().store
+    store.wipe_all()
+    reg = get_registry()
+    reg.reset_session()
+    reg.load_from_store()
     return {"status": "ok"}
 
 
@@ -150,9 +167,23 @@ async def list_voices(x_api_key: str = Header(...)) -> list[VoiceInfo]:
             voice_id=r.voice_id,
             display_name=r.display_name,
             segment_count=r.segment_count,
+            unreliable=r.unreliable,
         )
         for r in store.list_voices()
     ]
+
+
+@app.patch("/voices/{voice_id}/flags")
+async def set_voice_flags(
+    voice_id: str,
+    body: VoiceFlagsBody,
+    x_api_key: str = Header(...),
+) -> dict[str, str]:
+    check_api_key(x_api_key)
+    store = get_registry().store
+    if not store.set_flag_unreliable(voice_id, body.unreliable):
+        raise HTTPException(status_code=404, detail="voice_id not found")
+    return {"status": "ok", "voice_id": voice_id}
 
 
 @app.patch("/voices/{voice_id}")

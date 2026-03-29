@@ -53,6 +53,17 @@ body {
   cursor: not-allowed;
 }
 
+.toolbar button.btn-danger {
+  border-color: #7f1d1d;
+  background: #3f1218;
+  color: #fecaca;
+}
+
+.toolbar button.btn-danger:hover:not(:disabled) {
+  background: #5c1a22;
+  border-color: #b91c1c;
+}
+
 .speakers-field {
   display: flex;
   align-items: center;
@@ -89,6 +100,13 @@ body {
 
 .status-line .source-file::before {
   content: "· ";
+}
+
+.status-line .log-restore-hint {
+  flex-basis: 100%;
+  font-size: 0.78rem;
+  color: var(--accent);
+  max-width: 100%;
 }
 
 .status-dot {
@@ -137,10 +155,44 @@ body {
 .line {
   margin-bottom: 0.35rem;
   padding: 0.15rem 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  flex-wrap: wrap;
 }
 
 .line-inner {
   display: inline;
+  flex: 1;
+  min-width: 0;
+}
+
+.line-score {
+  color: var(--muted);
+  font-size: 0.82em;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.6rem;
+}
+
+.line-fix {
+  flex-shrink: 0;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #252b38;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.line-fix:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.line-fix[hidden] {
+  display: none !important;
 }
 
 .line-time {
@@ -197,6 +249,59 @@ body {
 
 .speaker-card.is-labeled {
   border-color: var(--accent);
+}
+
+.speaker-card.is-unreliable {
+  border-style: dashed;
+  opacity: 0.92;
+}
+
+.speaker-flag {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0.5rem 0;
+  cursor: pointer;
+}
+
+.speaker-merge {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 0.35rem;
+}
+
+.speaker-merge select {
+  flex: 1;
+  min-width: 140px;
+  padding: 0.3rem 0.45rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #151922;
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.speaker-merge button {
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #2a3145;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.reassign-actions {
+  justify-content: flex-start;
+}
+
+.btn-muted {
+  background: #1e2430 !important;
+  color: var(--muted) !important;
 }
 
 .speaker-card h3 {

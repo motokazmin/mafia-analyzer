@@ -31,7 +31,7 @@
 
 3. Открыть в браузере: http://localhost:8080
 
-Флаги gateway: `-voice-url` (обязательно), `-port` (по умолчанию 8080), `-api-key`, `-static` (по умолчанию ищется `web/static` или `static`).
+Флаги gateway: `-voice-url` (обязательно), `-port` (по умолчанию 8080), `-api-key`, `-static`, `-game-db` (журнал партий в SQLite, по умолчанию `data/game_log.sqlite`; пустая строка отключает).
 
 ## Сборка бинарника
 
@@ -42,6 +42,6 @@ go build -o bin/gateway ./cmd/gateway
 ## Связанные документы
 
 - [docs/SETUP.md](docs/SETUP.md) — зависимости, переменные окружения, типичные ошибки
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — слои и границы модулей
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — архитектура решения: слои, две БД, потоки данных, WS и HTTP API
 - [COLAB.md](COLAB.md) — перенос на Google Drive / Colab
 - **[colab.ipynb](colab.ipynb)** — ноутбук для запуска voice-worker в Google Colab

@@ -38,12 +38,29 @@ ENABLE_VOICE_LEARNING = os.environ.get("ENABLE_VOICE_LEARNING", "true").lower() 
     "yes",
 )
 
-# Thresholds (same semantics as whisperx-WavLM-colab notebook)
-THRESHOLD_CONFIDENT_MATCH = float(os.environ.get("THRESHOLD_CONFIDENT_MATCH", "0.75"))
-THRESHOLD_SOFT_MATCH = float(os.environ.get("THRESHOLD_SOFT_MATCH", "0.60"))
-THRESHOLD_FORCE_NEW = float(os.environ.get("THRESHOLD_FORCE_NEW", "0.45"))
-SIMILARITY_UPDATE_MIN = float(os.environ.get("SIMILARITY_UPDATE_MIN", "0.65"))
-PENDING_MATCH_THRESHOLD = float(os.environ.get("PENDING_MATCH_THRESHOLD", "0.55"))
+# Пороги: пресет VOICE_THRESHOLD_PRESET=balanced|strict|loose задаёт базу; отдельные THRESHOLD_* переопределяют.
+
+
+def _env_float(key: str, default: float) -> float:
+    v = os.environ.get(key)
+    if v is None or str(v).strip() == "":
+        return default
+    return float(v)
+
+
+_preset = os.environ.get("VOICE_THRESHOLD_PRESET", "balanced").strip().lower()
+_bc, _bs, _bf = 0.75, 0.60, 0.45
+if _preset == "strict":
+    _bc, _bs, _bf = 0.82, 0.66, 0.38
+elif _preset == "loose":
+    _bc, _bs, _bf = 0.68, 0.54, 0.50
+
+# balanced / неизвестное значение — дефолты как в whisperx-WavLM-colab
+THRESHOLD_CONFIDENT_MATCH = _env_float("THRESHOLD_CONFIDENT_MATCH", _bc)
+THRESHOLD_SOFT_MATCH = _env_float("THRESHOLD_SOFT_MATCH", _bs)
+THRESHOLD_FORCE_NEW = _env_float("THRESHOLD_FORCE_NEW", _bf)
+SIMILARITY_UPDATE_MIN = _env_float("SIMILARITY_UPDATE_MIN", 0.65)
+PENDING_MATCH_THRESHOLD = _env_float("PENDING_MATCH_THRESHOLD", 0.55)
 
 CALIBRATION_WINDOW = float(os.environ.get("CALIBRATION_WINDOW_SEC", "300.0"))
 MAX_EXTRA_SLOTS = int(os.environ.get("MAX_EXTRA_SLOTS", "2"))

@@ -35,7 +35,10 @@ func NewRouter(cfg Config, sm *session.Manager, vc *voiceclient.Client, h *hub.H
 		r.Post("/session/start", handleSessionStart(sm))
 		r.Post("/session/stop", handleSessionStop(sm))
 		r.Get("/session/status", handleSessionStatus(sm, cfg.Store))
+		r.Post("/data/reset", handleDataReset(sm, cfg.Store, vc, h))
 		r.Post("/upload", handleUpload)
+		r.Post("/speakers/merge", handleSpeakerMerge(vc, h))
+		r.Patch("/speakers/{id}/flags", handleSpeakerFlags(vc, h))
 		r.Get("/speakers", handleSpeakersList(vc))
 		r.Post("/speakers/{id}/label", handleSpeakerLabel(vc, h))
 	})
@@ -45,6 +48,8 @@ func NewRouter(cfg Config, sm *session.Manager, vc *voiceclient.Client, h *hub.H
 			r.Get("/sessions", handleListGameSessions(cfg.Store))
 			r.Get("/sessions/{id}", handleGetGameSession(cfg.Store))
 			r.Get("/sessions/{id}/segments", handleListGameSegments(cfg.Store))
+			r.Post("/sessions/{id}/segments/{seq}/override", handleSegmentOverridePost(cfg.Store, h))
+			r.Delete("/sessions/{id}/segments/{seq}/override", handleSegmentOverrideDelete(cfg.Store, h))
 		})
 	}
 
@@ -342,6 +347,175 @@ func handleSpeakerLabel(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
 			"speaker_id": id,
 			"name":       body.Name,
 		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+type segmentOverrideBody struct {
+	Speaker string `json:"speaker"`
+	VoiceID string `json:"voice_id"`
+}
+
+func handleSegmentOverridePost(store *gamedb.Store, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if store == nil {
+			http.Error(w, "store disabled", http.StatusServiceUnavailable)
+			return
+		}
+		id := chi.URLParam(r, "id")
+		seqStr := chi.URLParam(r, "seq")
+		seq, err := strconv.Atoi(seqStr)
+		if err != nil || seq < 1 {
+			http.Error(w, "bad seq", http.StatusBadRequest)
+			return
+		}
+		var body segmentOverrideBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.Speaker = strings.TrimSpace(body.Speaker)
+		body.VoiceID = strings.TrimSpace(body.VoiceID)
+		if body.Speaker == "" || body.VoiceID == "" {
+			http.Error(w, "speaker and voice_id required", http.StatusBadRequest)
+			return
+		}
+		if err := store.UpsertSegmentOverride(id, seq, body.Speaker, body.VoiceID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":            "segment_override",
+			"game_session_id": id,
+			"seq":             seq,
+			"speaker":         body.Speaker,
+			"voice_id":        body.VoiceID,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+func handleSegmentOverrideDelete(store *gamedb.Store, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if store == nil {
+			http.Error(w, "store disabled", http.StatusServiceUnavailable)
+			return
+		}
+		id := chi.URLParam(r, "id")
+		seqStr := chi.URLParam(r, "seq")
+		seq, err := strconv.Atoi(seqStr)
+		if err != nil || seq < 1 {
+			http.Error(w, "bad seq", http.StatusBadRequest)
+			return
+		}
+		if err := store.DeleteSegmentOverride(id, seq); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":            "segment_override",
+			"game_session_id": id,
+			"seq":             seq,
+			"cleared":         true,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+type mergeBody struct {
+	SourceID string `json:"source_id"`
+	TargetID string `json:"target_id"`
+}
+
+func handleSpeakerMerge(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body mergeBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.SourceID = strings.TrimSpace(body.SourceID)
+		body.TargetID = strings.TrimSpace(body.TargetID)
+		if body.SourceID == "" || body.TargetID == "" || body.SourceID == body.TargetID {
+			http.Error(w, "source_id and target_id required", http.StatusBadRequest)
+			return
+		}
+		if err := vc.MergeVoices(body.SourceID, body.TargetID); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":      "merge",
+			"source_id": body.SourceID,
+			"target_id": body.TargetID,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+type speakerFlagsBody struct {
+	Unreliable bool `json:"unreliable"`
+}
+
+func handleSpeakerFlags(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+		var body speakerFlagsBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := vc.SetVoiceFlags(id, body.Unreliable); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":       "voice_flags",
+			"speaker_id": id,
+			"unreliable": body.Unreliable,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+type dataResetBody struct {
+	Confirm bool `json:"confirm"`
+}
+
+func handleDataReset(sm *session.Manager, store *gamedb.Store, vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body dataResetBody
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if !body.Confirm {
+			http.Error(w, `тело: {"confirm": true}`, http.StatusBadRequest)
+			return
+		}
+		st, _ := sm.Status()
+		if st != "idle" {
+			http.Error(w, "остановите сессию (кнопка Стоп)", http.StatusConflict)
+			return
+		}
+		sm.Stop()
+		if store != nil {
+			if err := store.WipeAll(); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		if err := vc.WipeVoices(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{"type": "data_reset"})
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
