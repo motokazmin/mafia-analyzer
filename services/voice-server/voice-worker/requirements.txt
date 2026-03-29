@@ -1,0 +1,10 @@
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+numpy>=1.24.0
+# WavLM For X-Vector (microsoft/wavlm-base-plus-sv); на Colab см. colab.ipynb — сначала pip uninstall torchvision
+transformers>=4.41.0,<5
+whisperx>=3.1.0
+speechbrain>=1.0.0
+nest-asyncio>=1.5.0
+pyngrok>=7.0.0

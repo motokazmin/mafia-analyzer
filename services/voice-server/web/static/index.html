@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mafia — распознавание речи</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="toolbar-actions">
+      <button type="button" id="btnIngest">Обучить на записи</button>
+      <button type="button" id="btnFile">Тест на файле</button>
+      <button type="button" id="btnRecord">Живая игра</button>
+      <button type="button" id="btnStop" disabled>Стоп</button>
+    </div>
+    <label class="speakers-field">
+      Спикеров (опц.)
+      <input type="number" id="speakersInput" min="1" max="32" placeholder="—">
+    </label>
+    <div class="status-line" id="statusLine">
+      <span class="status-dot" id="statusDot" data-state="idle"></span>
+      <span id="statusText">Ожидание</span>
+      <span class="source-file" id="sourceFileLabel" hidden></span>
+    </div>
+    <button type="button" id="btnSaveLog">Сохранить лог</button>
+  </header>
+
+  <div class="layout">
+    <main class="log-wrap">
+      <div id="log" class="log" aria-live="polite"></div>
+    </main>
+    <aside id="speakersPanel" class="speakers-panel is-hidden">
+      <h2>Спикеры</h2>
+      <div id="speakersCards"></div>
+    </aside>
+  </div>
+
+  <div id="labelPopup" class="label-popup is-hidden" role="dialog">
+    <div class="label-popup-title" id="labelPopupTitle"></div>
+    <label>Кто это?</label>
+    <select id="labelSelect"></select>
+    <div class="label-new">
+      <input type="text" id="labelNewInput" placeholder="Новое имя">
+      <button type="button" id="labelOk">OK</button>
+    </div>
+  </div>
+
+  <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.ogg" hidden>
+
+  <script src="/app.js"></script>
+</body>
+</html>
