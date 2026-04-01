@@ -15,7 +15,7 @@ import (
 	"voice-server/internal/voiceclient"
 )
 
-// Manager — одна глобальная сессия; новый старт отменяет предыдущую (use case).
+// Manager — одна глобальная сессия; новый старт отменяет предыдущую.
 type Manager struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -39,7 +39,6 @@ func NewManager(vc *voiceclient.Client, h *hub.Hub, store *gamedb.Store) *Manage
 	}
 }
 
-// ActiveGameID — id партии в локальной БД (для выгрузки / анализа), пусто если idle.
 func (m *Manager) ActiveGameID() string {
 	m.muGame.Lock()
 	defer m.muGame.Unlock()
@@ -77,7 +76,7 @@ func (m *Manager) onSegment(gameID string) func(domain.Segment) {
 		wall := time.Now().Format("15:04:05")
 		if m.store != nil && gameID != "" {
 			if err := m.store.InsertSegment(gameID, seq, s, wall); err != nil {
-				log.Printf("gamedb segment: %v", err)
+				log.Printf("[session] gamedb insert segment seq=%d: %v", seq, err)
 			}
 		}
 		msg := map[string]interface{}{
@@ -155,14 +154,54 @@ func (m *Manager) deferIdle(gameID string) {
 	m.mu.Unlock()
 	if m.store != nil && gameID != "" {
 		if err := m.store.EndSession(gameID); err != nil {
-			log.Printf("gamedb end session: %v", err)
+			log.Printf("[session] gamedb end session %s: %v", gameID, err)
 		}
 	}
 	m.clearActiveGameID(gameID)
 	m.hub.BroadcastStatus("idle")
 }
 
-// StartIngest — full_file; originalFilename — имя загруженного файла для анализа.
+// broadcastWorkerError sends a worker_error event to all WS clients.
+func (m *Manager) broadcastWorkerError(err error) {
+	log.Printf("[session] worker error, broadcasting to clients: %v", err)
+	m.hub.BroadcastJSON(map[string]interface{}{
+		"type":    "worker_error",
+		"message": err.Error(),
+	})
+}
+
+// broadcastSplitSuggestions fetches split candidates from the worker and
+// broadcasts a voice_split_suggested event if any are found.
+// Called after ingest/file jobs complete — never blocks the caller on error.
+func (m *Manager) broadcastSplitSuggestions() {
+	candidates, err := m.vc.GetSplitCandidates()
+	if err != nil {
+		log.Printf("[session] broadcastSplitSuggestions: %v", err)
+		return
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	log.Printf("[session] split suggestions: %d candidate(s)", len(candidates))
+
+	// Convert to a plain []map for JSON serialisation
+	items := make([]map[string]interface{}, 0, len(candidates))
+	for _, c := range candidates {
+		items = append(items, map[string]interface{}{
+			"voice_id":          c.VoiceID,
+			"display_name":      c.DisplayName,
+			"embedding_count":   c.EmbeddingCount,
+			"max_pairwise_dist": c.MaxPairwiseDist,
+			"cluster_a_size":    c.ClusterASize,
+			"cluster_b_size":    c.ClusterBSize,
+		})
+	}
+	m.hub.BroadcastJSON(map[string]interface{}{
+		"type":       "voice_split_suggested",
+		"candidates": items,
+	})
+}
+
 func (m *Manager) StartIngest(filePath string, speakers int, removeAfter bool, originalFilename string) {
 	gameID := m.openGameSession(gamedb.SessionMeta{
 		CaptureSource:  gamedb.CaptureSourceFile,
@@ -180,8 +219,11 @@ func (m *Manager) StartIngest(filePath string, speakers int, removeAfter bool, o
 		}
 		onSeg := m.onSegment(gameID)
 		if err := pipeline.SendIngestFull(m.vc, speakers, onSeg, filePath); err != nil {
-			log.Printf("ingest: %v", err)
+			log.Printf("[session] ingest error: %v", err)
+			m.broadcastWorkerError(err)
+			return
 		}
+		m.broadcastSplitSuggestions()
 		_ = ctx
 	}()
 }
@@ -198,7 +240,7 @@ func (m *Manager) StartFile(filePath string, speakers int, originalFilename stri
 		SourceFilename: src,
 	})
 	if err := m.vc.Reset(); err != nil {
-		log.Printf("reset: %v", err)
+		log.Printf("[session] reset before file: %v", err)
 	}
 	m.setRunning("file")
 	m.hub.BroadcastStatus("running")
@@ -207,8 +249,11 @@ func (m *Manager) StartFile(filePath string, speakers int, originalFilename stri
 		defer m.deferIdle(gameID)
 		onSeg := m.onSegment(gameID)
 		if err := pipeline.RunFile(ctx, m.vc, speakers, onSeg, filePath); err != nil {
-			log.Printf("runFile: %v", err)
+			log.Printf("[session] runFile error: %v", err)
+			m.broadcastWorkerError(err)
+			return
 		}
+		m.broadcastSplitSuggestions()
 	}()
 }
 
@@ -219,7 +264,7 @@ func (m *Manager) StartRecord(speakers int) {
 		SpeakersHint:  speakers,
 	})
 	if err := m.vc.Reset(); err != nil {
-		log.Printf("reset: %v", err)
+		log.Printf("[session] reset before record: %v", err)
 	}
 	m.setRunning("record")
 	m.hub.BroadcastStatus("running")
@@ -227,6 +272,7 @@ func (m *Manager) StartRecord(speakers int) {
 	go func() {
 		defer m.deferIdle(gameID)
 		pipeline.RunRecord(ctx, m.vc, speakers, m.onSegment(gameID))
+		// Record mode: no split suggestions (streaming, not full-file)
 	}()
 }
 
@@ -236,12 +282,10 @@ func (m *Manager) openGameSession(meta gamedb.SessionMeta) string {
 	}
 	id, err := m.store.CreateSession(meta)
 	if err != nil {
-		log.Printf("gamedb create session: %v", err)
+		log.Printf("[session] gamedb create session: %v", err)
 		return ""
 	}
-	if meta.SourceFilename != "" {
-		log.Printf("game session %s source file: %s", id, meta.SourceFilename)
-	}
+	log.Printf("[session] started game=%s mode=%s file=%q", id, meta.SessionMode, meta.SourceFilename)
 	m.setActiveGameID(id)
 	return id
 }

@@ -38,9 +38,12 @@ func NewRouter(cfg Config, sm *session.Manager, vc *voiceclient.Client, h *hub.H
 		r.Post("/data/reset", handleDataReset(sm, cfg.Store, vc, h))
 		r.Post("/upload", handleUpload)
 		r.Post("/speakers/merge", handleSpeakerMerge(vc, h))
+		r.Post("/speakers/split", handleSpeakerSplit(vc, h))
+		r.Get("/speakers/split_candidates", handleSplitCandidates(vc))
 		r.Patch("/speakers/{id}/flags", handleSpeakerFlags(vc, h))
 		r.Get("/speakers", handleSpeakersList(vc))
 		r.Post("/speakers/{id}/label", handleSpeakerLabel(vc, h))
+		r.Delete("/speakers/{id}/segments", handleDeleteSpeakerSegments(vc, h))
 	})
 
 	if cfg.Store != nil {
@@ -155,7 +158,7 @@ type sessionStartBody struct {
 	Mode           string `json:"mode"`
 	Speakers       int    `json:"speakers"`
 	FilePath       string `json:"file_path"`
-	SourceFilename string `json:"source_filename,omitempty"` // оригинальное имя файла (тест по файлу)
+	SourceFilename string `json:"source_filename,omitempty"`
 }
 
 func handleSessionStart(sm *session.Manager) http.HandlerFunc {
@@ -456,6 +459,78 @@ func handleSpeakerMerge(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
 }
+
+// ── Split ──────────────────────────────────────────────────────────────────────
+
+type splitBody struct {
+	VoiceID string `json:"voice_id"`
+}
+
+func handleSpeakerSplit(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body splitBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.VoiceID = strings.TrimSpace(body.VoiceID)
+		if body.VoiceID == "" {
+			http.Error(w, "voice_id required", http.StatusBadRequest)
+			return
+		}
+		keptID, newID, err := vc.SplitVoice(body.VoiceID, nil, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":     "voice_split",
+			"voice_id": body.VoiceID,
+			"kept_id":  keptID,
+			"new_id":   newID,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"kept_id": keptID,
+			"new_id":  newID,
+		})
+	}
+}
+
+func handleSplitCandidates(vc *voiceclient.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		candidates, err := vc.GetSplitCandidates()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(candidates)
+	}
+}
+
+func handleDeleteSpeakerSegments(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		if id == "" {
+			http.Error(w, "missing id", http.StatusBadRequest)
+			return
+		}
+		if err := vc.DeleteVoiceSegments(id); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		h.BroadcastJSON(map[string]interface{}{
+			"type":       "voice_segments_cleared",
+			"speaker_id": id,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	}
+}
+
+// ── Speaker flags ──────────────────────────────────────────────────────────────
 
 type speakerFlagsBody struct {
 	Unreliable bool `json:"unreliable"`
