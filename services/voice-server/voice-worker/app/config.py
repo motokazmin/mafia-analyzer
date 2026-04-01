@@ -26,8 +26,23 @@ def _resolve_database_path() -> Path:
 
 DATABASE_PATH = _resolve_database_path()
 
+def _detect_device() -> tuple[str, bool]:
+    """Определяет устройство: приоритет явной переменной, затем наличие CUDA."""
+    if os.environ.get("VOICE_SERVER_DEVICE"):
+        dev = os.environ["VOICE_SERVER_DEVICE"].lower()
+        return dev, (dev == "cuda")
+    
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda", True
+    except ImportError:
+        pass
+    return "cpu", False
+
+DEVICE, GPU_AVAILABLE = _detect_device()
+
 # Models
-DEVICE = os.environ.get("VOICE_SERVER_DEVICE", "cuda")
 WHISPER_MODEL = os.environ.get("VOICE_SERVER_WHISPER_MODEL", "large-v2")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
@@ -61,6 +76,7 @@ THRESHOLD_SOFT_MATCH = _env_float("THRESHOLD_SOFT_MATCH", _bs)
 THRESHOLD_FORCE_NEW = _env_float("THRESHOLD_FORCE_NEW", _bf)
 SIMILARITY_UPDATE_MIN = _env_float("SIMILARITY_UPDATE_MIN", 0.65)
 PENDING_MATCH_THRESHOLD = _env_float("PENDING_MATCH_THRESHOLD", 0.55)
+SPLIT_DISTANCE_THRESHOLD = _env_float("SPLIT_DISTANCE_THRESHOLD", 0.22)
 
 CALIBRATION_WINDOW = float(os.environ.get("CALIBRATION_WINDOW_SEC", "300.0"))
 MAX_EXTRA_SLOTS = int(os.environ.get("MAX_EXTRA_SLOTS", "2"))

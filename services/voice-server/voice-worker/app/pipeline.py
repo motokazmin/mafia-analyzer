@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import logging
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -10,14 +12,17 @@ import torch
 import whisperx
 from whisperx.diarize import DiarizationPipeline
 
-# Colab / разные версии transformers: WavLMForXVector может быть только через lazy-import.
 try:
     from transformers import AutoFeatureExtractor, WavLMForXVector
-except ImportError:  # pragma: no cover
+except ImportError:
     from transformers import AutoFeatureExtractor
     from transformers.models.wavlm.modeling_wavlm import WavLMForXVector
 
 from app import config
+
+log = logging.getLogger("voice")
+
+_WAVLM_MODEL = "microsoft/wavlm-base-plus-sv"
 
 
 class ModelHolder:
@@ -32,28 +37,71 @@ class ModelHolder:
     def ensure_loaded(self) -> None:
         if self._loaded:
             return
+
         if not config.HF_TOKEN:
             raise RuntimeError("HF_TOKEN is required for diarization (pyannote)")
-        compute_type = "float16" if self.device == "cuda" else "float32"
+
+        compute_type = "float16" if self.device == "cuda" else "int8"
+
+        log.info("=" * 60)
+        log.info("loading models — startup config:")
+        log.info("  device        : %s", self.device.upper())
+        log.info("  compute_type  : %s", compute_type)
+        log.info("  whisper model : %s", config.WHISPER_MODEL)
+        log.info("  wavlm model   : %s", _WAVLM_MODEL)
+        log.info("  language      : ru (fixed)")
+        log.info("  vad_onset     : 0.500  vad_offset: 0.363")
+        log.info("thresholds:")
+        log.info("  confident     : %.2f", config.THRESHOLD_CONFIDENT_MATCH)
+        log.info("  soft_match    : %.2f", config.THRESHOLD_SOFT_MATCH)
+        log.info("  force_new     : %.2f", config.THRESHOLD_FORCE_NEW)
+        log.info("  sim_update_min: %.2f", config.SIMILARITY_UPDATE_MIN)
+        log.info("  pending_match : %.2f", config.PENDING_MATCH_THRESHOLD)
+        log.info("session:")
+        log.info("  calibration_window : %.0fs", config.CALIBRATION_WINDOW)
+        log.info("  max_extra_slots    : %d",   config.MAX_EXTRA_SLOTS)
+        log.info("  min_speaker_dur    : %.1fs", config.MIN_SPEAKER_DURATION)
+        log.info("  embedding_buf_size : %d",   config.EMBEDDING_BUFFER_SIZE)
+        log.info("  voice_learning     : %s",   config.ENABLE_VOICE_LEARNING)
+        log.info("  split_distance_threshold : %.3f", config.SPLIT_DISTANCE_THRESHOLD)
+        log.info("  db_path            : %s",   config.DATABASE_PATH)
+        log.info("=" * 60)
+
+        t0 = time.monotonic()
+        log.info("[1/3] loading Whisper %s ...", config.WHISPER_MODEL)
         self.whisper_model = whisperx.load_model(
             config.WHISPER_MODEL,
             self.device,
             compute_type=compute_type,
-            vad_options={"vad_onset": 0.5, "vad_offset": 0.363},
+            vad_options={"vad_onset": 0.500, "vad_offset": 0.363},
         )
+        log.info("[1/3] Whisper loaded in %.1fs", time.monotonic() - t0)
+
+        t1 = time.monotonic()
+        log.info("[2/3] loading pyannote DiarizationPipeline ...")
         self.diarize_model = DiarizationPipeline(
-            token=config.HF_TOKEN, device=self.device
+            token=config.HF_TOKEN,
+            device=self.device,
         )
-        mid = "microsoft/wavlm-base-plus-sv"
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(mid)
-        self.wavlm_model = WavLMForXVector.from_pretrained(mid).to(self.device)
+        log.info("[2/3] pyannote loaded in %.1fs", time.monotonic() - t1)
+
+        t2 = time.monotonic()
+        log.info("[3/3] loading WavLM %s ...", _WAVLM_MODEL)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(_WAVLM_MODEL)
+        self.wavlm_model = WavLMForXVector.from_pretrained(_WAVLM_MODEL).to(self.device)
         self.wavlm_model.eval()
+        log.info("[3/3] WavLM loaded in %.1fs", time.monotonic() - t2)
+
+        total = time.monotonic() - t0
+        log.info("all models ready in %.1fs", total)
+        log.info("=" * 60)
+
         self._loaded = True
 
     def unload_cuda(self) -> None:
-        gc.collect()
-        if torch.cuda.is_available():
+        if self.device == "cuda":
             torch.cuda.empty_cache()
+        gc.collect()
 
     def run_wavlm(self, combined: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
         self.ensure_loaded()
@@ -66,22 +114,26 @@ class ModelHolder:
                 emb = self.wavlm_model(**inputs).embeddings
             return emb.squeeze().cpu().numpy()
         except Exception as e:
-            print(f">>> WavLM error: {e}")
+            log.error("WavLM error: %s", e)
             return None
 
-    def transcribe_align(
-        self, audio: np.ndarray
-    ) -> tuple[dict[str, Any], np.ndarray]:
+    def transcribe_align(self, audio: np.ndarray) -> tuple[dict[str, Any], np.ndarray]:
         self.ensure_loaded()
-        result = self.whisper_model.transcribe(
-            audio, batch_size=16, language="ru"
-        )
+        b_size = 16 if self.device == "cuda" else 4
+        audio_sec = len(audio) / 16000
+
+        log.info("transcribe: audio=%.1fs, batch_size=%d, lang=ru", audio_sec, b_size)
+        t0 = time.monotonic()
+        result = self.whisper_model.transcribe(audio, batch_size=b_size, language="ru")
+        log.info("transcribe done in %.1fs — %d raw segment(s)", time.monotonic() - t0, len(result.get("segments", [])))
+
+        t1 = time.monotonic()
         model_a, meta = whisperx.load_align_model(
             language_code=result["language"], device=self.device
         )
-        result = whisperx.align(
-            result["segments"], model_a, meta, audio, self.device
-        )
+        result = whisperx.align(result["segments"], model_a, meta, audio, self.device)
+        log.info("align done in %.1fs — %d aligned segment(s)", time.monotonic() - t1, len(result.get("segments", [])))
+
         del model_a
         self.unload_cuda()
         return result, audio
@@ -93,19 +145,33 @@ class ModelHolder:
         max_speakers: Optional[int] = None,
     ) -> Any:
         self.ensure_loaded()
-        kwargs = {}
+        audio_sec = len(audio) / 16000
+        kwargs: dict[str, Any] = {}
         if min_speakers is not None:
             kwargs["min_speakers"] = min_speakers
         if max_speakers is not None:
             kwargs["max_speakers"] = max_speakers
+
+        log.info(
+            "diarize: audio=%.1fs, min_speakers=%s, max_speakers=%s",
+            audio_sec,
+            kwargs.get("min_speakers", "auto"),
+            kwargs.get("max_speakers", "auto"),
+        )
+        t0 = time.monotonic()
         try:
-            return self.diarize_model(audio, **kwargs)
+            result = self.diarize_model(audio, **kwargs)
+            log.info("diarize done in %.1fs", time.monotonic() - t0)
+            return result
         except Exception as e:
             if "n_samples" in str(e) and "n_clusters" in str(e):
-                fb = {}
+                log.warning("diarize failed with n_clusters error, retrying without min_speakers: %s", e)
+                fb: dict[str, Any] = {}
                 if max_speakers is not None:
                     fb["max_speakers"] = max_speakers
-                return self.diarize_model(audio, **fb)
+                result = self.diarize_model(audio, **fb)
+                log.info("diarize retry done in %.1fs", time.monotonic() - t0)
+                return result
             raise
 
 

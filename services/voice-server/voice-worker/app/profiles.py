@@ -46,16 +46,19 @@ class SpeakerProfile:
         self._display_name = value
 
     def vote_similarity(self, embedding: np.ndarray) -> float:
+        """Cosine similarity averaged over recent buffer, newer embeddings weighted more."""
         if not self.buffer:
             return -1.0
-        sims = [
-            float(
-                np.dot(e, embedding)
-                / (np.linalg.norm(e) * np.linalg.norm(embedding) + 1e-8)
-            )
-            for e in self.buffer
-        ]
-        return float(np.mean(sims)) if sims else -1.0
+        buf = list(self.buffer)
+        n = len(buf)
+        # Exponential weights: most recent embedding gets weight ~e^0=1, oldest ~e^-1≈0.37
+        weights = np.exp(np.linspace(-1.0, 0.0, n))
+        weights /= weights.sum()
+        sims = np.array([
+            float(np.dot(e, embedding) / (np.linalg.norm(e) * np.linalg.norm(embedding) + 1e-8))
+            for e in buf
+        ])
+        return float(np.dot(weights, sims))
 
     def update(self, embedding: np.ndarray, sim: float) -> None:
         self.buffer.append(embedding.copy())
