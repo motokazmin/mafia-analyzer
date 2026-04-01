@@ -13,6 +13,7 @@
       <button type="button" id="btnFile">Тест на файле</button>
       <button type="button" id="btnRecord">Живая игра</button>
       <button type="button" id="btnStop" disabled>Стоп</button>
+      <button type="button" id="btnArchive">📂 Архив игр</button>
     </div>
     <label class="speakers-field">
       Спикеров (опц.)
@@ -40,6 +41,20 @@
     </aside>
   </div>
 
+  <!-- Архив сохранённых игр -->
+  <div id="archiveOverlay" class="archive-overlay is-hidden" role="dialog" aria-modal="true">
+    <div class="archive-modal">
+      <div class="archive-header">
+        <h2>Архив игр</h2>
+        <button type="button" id="btnArchiveClose" class="btn-muted">✕</button>
+      </div>
+      <div id="archiveList" class="archive-list">
+        <div class="archive-loading">Загрузка…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Попап назначения имени -->
   <div id="labelPopup" class="label-popup is-hidden" role="dialog">
     <div class="label-popup-title" id="labelPopupTitle"></div>
     <label>Кто это?</label>
@@ -50,6 +65,7 @@
     </div>
   </div>
 
+  <!-- Попап переназначения реплики -->
   <div id="reassignPopup" class="label-popup is-hidden" role="dialog">
     <div class="label-popup-title">Переназначить реплику</div>
     <label>Голос из реестра</label>
