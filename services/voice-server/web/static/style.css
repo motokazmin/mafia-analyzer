@@ -208,6 +208,16 @@ body {
   color: var(--text);
 }
 
+.line.is-highlighted {
+  background: #1a2235;
+  border-radius: 4px;
+}
+
+.line.is-dimmed {
+  opacity: 0.28;
+  transition: opacity 0.15s;
+}
+
 .line.is-gray .line-speaker,
 .line.is-gray .line-text {
   color: var(--muted);
@@ -245,6 +255,18 @@ body {
   padding: 0.75rem;
   margin-bottom: 0.75rem;
   background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.speaker-card:hover {
+  border-color: #3d4a62;
+}
+
+.speaker-card.is-highlight-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #5b8cff33;
+  cursor: pointer;
 }
 
 .speaker-card.is-labeled {
@@ -292,6 +314,46 @@ body {
   border: 1px solid var(--border);
   background: #2a3145;
   color: var(--text);
+  cursor: pointer;
+}
+
+.speaker-split {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid #2a3142;
+}
+
+.btn-split {
+  flex: 1;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.8rem;
+  border-radius: 4px;
+  border: 1px solid #7c3aed;
+  background: #1e133a;
+  color: #c4b5fd;
+  cursor: pointer;
+  text-align: left;
+}
+
+.btn-split:hover:not(:disabled) {
+  background: #2d1c55;
+  border-color: #a78bfa;
+}
+
+.btn-split:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.speaker-split .btn-muted {
+  flex-shrink: 0;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.8rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
   cursor: pointer;
 }
 
@@ -394,4 +456,145 @@ body {
 
 .drop-active .log-wrap {
   outline: 2px dashed var(--accent);
+}
+
+/* ─── Подсветка строк при выборе спикера ─────────────────────────────────── */
+
+/* Когда активна подсветка — приглушаем все строки */
+.log.has-highlight .line {
+  opacity: 0.2;
+  transition: opacity 0.1s;
+}
+
+/* Подсвеченные строки — полная яркость + левая полоска */
+.log.has-highlight .line.is-highlighted {
+  opacity: 1;
+  border-left: 2px solid var(--accent);
+  padding-left: 0.4rem;
+  margin-left: -0.42rem;
+  background: #5b8cff0d;
+  border-radius: 3px;
+}
+
+/* ─── Архив игр ──────────────────────────────────────────────────────────── */
+
+.archive-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.archive-overlay.is-hidden {
+  display: none;
+}
+
+.archive-modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  width: 100%;
+  max-width: 600px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.archive-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.archive-header h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.archive-header .btn-muted {
+  padding: 0.3rem 0.6rem;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.archive-list {
+  overflow-y: auto;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.archive-loading,
+.archive-empty {
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 2rem 0;
+}
+
+.archive-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  transition: border-color 0.15s;
+}
+
+.archive-item:hover {
+  border-color: var(--accent);
+}
+
+.archive-item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.archive-item-date {
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.archive-item-mode {
+  font-size: 0.78rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 380px;
+}
+
+.archive-item-load {
+  flex-shrink: 0;
+  padding: 0.35rem 0.75rem;
+  border-radius: 5px;
+  border: 1px solid var(--accent);
+  background: #1a2540;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.archive-item-load:hover {
+  background: #253460;
 }
