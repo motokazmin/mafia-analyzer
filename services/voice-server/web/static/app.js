@@ -19,6 +19,8 @@
     reassignTarget: null,
     sourceFilename: "",
     gameSessionId: "",
+    splitCandidates: new Set(), // voice_id профилей, предложенных к разделению
+    highlightedVoiceId: null,  // voice_id залипшей подсветки
   };
 
   const LOG_STORAGE_KEY = "mafia_voice_ui_log_v1";
@@ -335,6 +337,49 @@
       .catch(() => {});
   }
 
+  function applySplitVoice(keptId, newId) {
+    // Refresh speakers list and colour map; segments keep their current voice_id
+    // (kept_id stays as-is). The new profile has no segments in the current log
+    // yet — it will appear in the panel and future segments may use it.
+    state.splitCandidates.delete(keptId);
+    refreshSpeakersPanel();
+    persistLogToStorage();
+  }
+
+  function setHighlight(voiceId) {
+    // Toggle: повторный клик на ту же карточку снимает подсветку
+    const next = state.highlightedVoiceId === voiceId ? null : voiceId;
+    state.highlightedVoiceId = next;
+
+    const logEl = $("log");
+    if (!next) {
+      logEl.classList.remove("has-highlight");
+      state.segments.forEach((seg) => {
+        const line = seg._line;
+        if (!line) return;
+        line.classList.remove("is-dimmed", "is-lit");
+      });
+    } else {
+      logEl.classList.add("has-highlight");
+      state.segments.forEach((seg) => {
+        const line = seg._line;
+        if (!line) return;
+        if (seg.voice_id === next) {
+          line.classList.add("is-lit");
+          line.classList.remove("is-dimmed");
+        } else {
+          line.classList.add("is-dimmed");
+          line.classList.remove("is-lit");
+        }
+      });
+    }
+
+    // Пометить активную карточку
+    document.querySelectorAll(".speaker-card").forEach((card) => {
+      card.classList.toggle("is-highlighted", !!next && card.dataset.voiceId === next);
+    });
+  }
+
   function applySegmentOverrideWS(data) {
     if (data.game_session_id && data.game_session_id !== state.gameSessionId) return;
     const seq = data.seq;
@@ -386,7 +431,34 @@
           refreshSpeakersPanel();
         } else if (data.type === "data_reset") {
           clearLog();
+          state.splitCandidates.clear();
           refreshSpeakersPanel();
+        } else if (data.type === "voice_split_suggested") {
+          if (Array.isArray(data.candidates) && data.candidates.length > 0) {
+            data.candidates.forEach((c) => state.splitCandidates.add(c.voice_id));
+            const names = data.candidates.map((c) => c.display_name || c.voice_id.slice(0, 8)).join(", ");
+            const hint = $("logRestoreHint");
+            if (hint) {
+              hint.hidden = false;
+              hint.textContent = "🔀 Система обнаружила смешанные голоса: " + names + ". Откройте панель Спикеры для разделения.";
+            }
+            refreshSpeakersPanel();
+          }
+        } else if (data.type === "voice_split") {
+          applySplitVoice(data.kept_id, data.new_id);
+        } else if (data.type === "voice_segments_cleared") {
+          state.splitCandidates.delete(data.speaker_id);
+          refreshSpeakersPanel();
+        } else if (data.type === "worker_error") {
+          setStopEnabled(false);
+          setStatusUi("idle");
+          const msg = (data.message || "").slice(0, 200);
+          console.error("[worker_error]", msg);
+          const hint = $("logRestoreHint");
+          if (hint) {
+            hint.hidden = false;
+            hint.textContent = "⚠ Ошибка воркера: " + msg;
+          }
         }
       };
       ws.onclose = () => {
@@ -416,6 +488,7 @@
     state.colorIndex = 0;
     state.sourceFilename = "";
     state.gameSessionId = "";
+    state.highlightedVoiceId = null;
     setSourceFileUi("");
     $("log").innerHTML = "";
     const hint = $("logRestoreHint");
@@ -562,43 +635,17 @@
     api("/api/speakers")
       .then((list) => {
         if (!Array.isArray(list)) return;
-
-        // Сначала — имена которые уже назначены вручную (из speakerNames)
-        const knownNames = knownNamesList();
-        if (knownNames.length > 0) {
-          const grp = document.createElement("optgroup");
-          grp.label = "Назначенные имена";
-          knownNames.forEach((n) => {
-            // Найти voice_id для этого имени
-            let vid = "";
-            state.speakerNames.forEach((v, k) => { if (v === n) vid = k; });
-            if (!vid || vid === seg.voice_id) return;
-            const o = document.createElement("option");
-            o.value = vid;
-            o.textContent = n;
-            o.dataset.speaker = n;
-            grp.appendChild(o);
-          });
-          if (grp.children.length > 0) sel.appendChild(grp);
-        }
-
-        // Затем — все голоса из реестра
-        const regVoices = list.filter((v) => v.voice_id !== seg.voice_id);
-        if (regVoices.length > 0) {
-          const grp = document.createElement("optgroup");
-          grp.label = "Реестр голосов";
-          regVoices.forEach((v) => {
-            const o = document.createElement("option");
-            o.value = v.voice_id;
-            const lab = v.display_name && String(v.display_name).trim()
-              ? v.display_name
-              : v.voice_id.slice(0, 8) + "…";
-            o.textContent = lab + " (" + v.voice_id.slice(0, 6) + "…)";
-            o.dataset.speaker = lab;
-            grp.appendChild(o);
-          });
-          sel.appendChild(grp);
-        }
+        list.forEach((v) => {
+          if (v.voice_id === seg.voice_id) return;
+          const o = document.createElement("option");
+          o.value = v.voice_id;
+          const lab = v.display_name && String(v.display_name).trim()
+            ? v.display_name
+            : v.voice_id.slice(0, 8) + "…";
+          o.textContent = lab + " (" + v.voice_id.slice(0, 6) + "…)";
+          o.dataset.speaker = lab;
+          sel.appendChild(o);
+        });
       })
       .catch(() => {});
     const x = ev.clientX;
@@ -632,7 +679,7 @@
     // Ничего не выбрано и не введено
     if (!freeText && !vid) return;
 
-    // Если введено имя вручную — отправляем без смены voice_id, но сохраняем имя в реестр
+    // Если введено имя вручную — сохраняем оверрайд + глобально переименовываем голос (#8)
     if (freeText) {
       const path =
         "/api/games/sessions/" +
@@ -640,33 +687,27 @@
         "/segments/" +
         encodeURIComponent(String(seg.seq)) +
         "/override";
+      const voiceId = seg.voice_id || "";
       api(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ speaker: freeText, voice_id: seg.voice_id || "" }),
+        body: JSON.stringify({ speaker: freeText, voice_id: voiceId }),
       })
         .then(() => {
-          // Сохранить имя в реестр голосов (чтобы появилось в панели и дропдауне)
-          if (seg.voice_id) {
-            api("/api/speakers/" + encodeURIComponent(seg.voice_id) + "/label", {
+          seg.speaker = freeText;
+          updateSegmentLine(seg);
+          closeReassignPopup();
+          persistLogToStorage();
+          // Также переименовываем голос глобально в Python, если voice_id известен
+          if (voiceId) {
+            api("/api/speakers/" + encodeURIComponent(voiceId) + "/label", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ name: freeText }),
             })
-              .then(() => {
-                applyLabel(seg.voice_id, freeText);
-                refreshSpeakersPanel();
-              })
-              .catch(() => {
-                // Если API недоступен — обновляем хотя бы локально
-                applyLabel(seg.voice_id, freeText);
-              });
-          } else {
-            seg.speaker = freeText;
-            updateSegmentLine(seg);
+              .then(() => refreshSpeakersPanel())
+              .catch((e) => console.warn("label after freeText reassign:", e));
           }
-          closeReassignPopup();
-          persistLogToStorage();
         })
         .catch((e) => alert(String(e)));
       return;
@@ -735,6 +776,41 @@
       });
   }
 
+  function setHighlight(voiceId) {
+    state.highlightedVoiceId = voiceId;
+    const logEl = $("log");
+    if (!logEl) return;
+    if (!voiceId) {
+      logEl.classList.remove("has-highlight");
+      logEl.querySelectorAll(".line.is-highlighted").forEach((el) => el.classList.remove("is-highlighted"));
+      return;
+    }
+    logEl.classList.add("has-highlight");
+    state.segments.forEach((seg) => {
+      if (!seg._line) return;
+      if (seg.voice_id === voiceId) {
+        seg._line.classList.add("is-highlighted");
+      } else {
+        seg._line.classList.remove("is-highlighted");
+      }
+    });
+    // Scroll to first highlighted line
+    const first = logEl.querySelector(".line.is-highlighted");
+    if (first) first.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function toggleHighlight(voiceId) {
+    if (state.highlightedVoiceId === voiceId) {
+      setHighlight(null);
+    } else {
+      setHighlight(voiceId);
+    }
+    // Update active state on cards
+    document.querySelectorAll(".speaker-card").forEach((card) => {
+      card.classList.toggle("is-highlight-active", card.dataset.voiceId === voiceId && state.highlightedVoiceId === voiceId);
+    });
+  }
+
   function refreshSpeakersPanel() {
     return api("/api/speakers")
       .then((list) => {
@@ -757,7 +833,21 @@
           const labeled = v.display_name && !isUnlabeledName(v.display_name);
           const card = document.createElement("div");
           card.className = "speaker-card" + (labeled ? " is-labeled" : "");
+          card.dataset.voiceId = vid;
           if (v.unreliable) card.classList.add("is-unreliable");
+          if (state.highlightedVoiceId === vid) card.classList.add("is-highlight-active");
+          card.addEventListener("click", (e) => {
+            // Don't trigger on interactive children (buttons, inputs, selects)
+            if (e.target.closest("button, input, select, label")) return;
+            toggleLogHighlight(vid);
+          });
+          if (state.highlightedVoiceId === vid) card.classList.add("is-highlight-active");
+          card.dataset.voiceId = vid;
+          card.addEventListener("click", (e) => {
+            // Не перехватываем клики по интерактивным элементам внутри карточки
+            if (e.target.closest("button, input, select, label, form")) return;
+            toggleHighlight(vid);
+          });
           const title = labeled ? v.display_name : vid.slice(0, 8) + "…";
           const titleColor = labeled
             ? getColorForKey((v.display_name || "").trim())
@@ -858,6 +948,63 @@
             card.appendChild(mergeRow);
           }
 
+          // ── Разделить голос (если есть предложение) ──────────────────
+          if (state.splitCandidates.has(vid)) {
+            const splitRow = document.createElement("div");
+            splitRow.className = "speaker-split";
+            const splitBtn = document.createElement("button");
+            splitBtn.type = "button";
+            splitBtn.className = "btn-split";
+            splitBtn.textContent = "🔀 Разделить на два голоса";
+            splitBtn.title = "Система обнаружила два разных голоса в этом профиле";
+            splitBtn.addEventListener("click", () => {
+              const displayTitle = labeled ? v.display_name : vid.slice(0, 8) + "…";
+              if (!confirm(
+                "Разделить «" + displayTitle + "» на два профиля?\n\n" +
+                "Система автоматически распределит накопленные эмбеддинги по кластерам.\n" +
+                "Сегменты в текущем логе не изменятся — переназначьте их вручную."
+              )) return;
+              splitBtn.disabled = true;
+              splitBtn.textContent = "Разделяем…";
+              api("/api/speakers/split", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ voice_id: vid }),
+              })
+                .then((res) => {
+                  state.splitCandidates.delete(vid);
+                  applySplitVoice(res.kept_id, res.new_id);
+                  const hint = $("logRestoreHint");
+                  if (hint) {
+                    hint.hidden = false;
+                    hint.textContent = "✓ Голос разделён. Новый профиль появился в панели.";
+                  }
+                })
+                .catch((err) => {
+                  splitBtn.disabled = false;
+                  splitBtn.textContent = "🔀 Разделить на два голоса";
+                  alert("Ошибка разделения: " + String(err));
+                });
+            });
+            splitRow.appendChild(splitBtn);
+
+            const dismissBtn = document.createElement("button");
+            dismissBtn.type = "button";
+            dismissBtn.className = "btn-muted";
+            dismissBtn.title = "Сбросить историю эмбеддингов (не предлагать снова)";
+            dismissBtn.textContent = "✕";
+            dismissBtn.addEventListener("click", () => {
+              api("/api/speakers/" + encodeURIComponent(vid) + "/segments", { method: "DELETE" })
+                .then(() => {
+                  state.splitCandidates.delete(vid);
+                  refreshSpeakersPanel();
+                })
+                .catch((err) => alert(String(err)));
+            });
+            splitRow.appendChild(dismissBtn);
+            card.appendChild(splitRow);
+          }
+
           cards.appendChild(card);
         });
       })
@@ -868,6 +1015,34 @@
     const d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  function applyLogHighlight(voiceId) {
+    state.highlightedVoiceId = voiceId;
+    state.segments.forEach((seg) => {
+      if (!seg._line) return;
+      if (voiceId === null) {
+        seg._line.classList.remove("is-dimmed", "is-highlighted");
+      } else if (seg.voice_id === voiceId) {
+        seg._line.classList.add("is-highlighted");
+        seg._line.classList.remove("is-dimmed");
+      } else {
+        seg._line.classList.add("is-dimmed");
+        seg._line.classList.remove("is-highlighted");
+      }
+    });
+    // Update card active state
+    document.querySelectorAll(".speaker-card").forEach((card) => {
+      card.classList.toggle("is-highlight-active", card.dataset.voiceId === voiceId);
+    });
+  }
+
+  function toggleLogHighlight(voiceId) {
+    if (state.highlightedVoiceId === voiceId) {
+      applyLogHighlight(null);
+    } else {
+      applyLogHighlight(voiceId);
+    }
   }
 
   function saveLogFile() {
@@ -961,6 +1136,17 @@
       setStopEnabled(false);
     });
     $("btnSaveLog").addEventListener("click", saveLogFile);
+
+    const btnArchive = $("btnArchive");
+    if (btnArchive) btnArchive.addEventListener("click", openArchive);
+    const btnArchiveClose = $("btnArchiveClose");
+    if (btnArchiveClose) btnArchiveClose.addEventListener("click", closeArchive);
+    const archiveOverlay = $("archiveOverlay");
+    if (archiveOverlay) {
+      archiveOverlay.addEventListener("click", (e) => {
+        if (e.target === archiveOverlay) closeArchive();
+      });
+    }
     const btnWipe = $("btnWipeData");
     if (btnWipe) {
       btnWipe.addEventListener("click", () => {
@@ -973,16 +1159,15 @@
         ) {
           return;
         }
+        // Чистим UI и localStorage сразу — до запроса, чтобы F5 не вернул старый лог
+        clearLog();
+        refreshSpeakersPanel();
         api("/api/data/reset", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ confirm: true }),
         })
-          .then(() => {
-            clearLog();
-            refreshSpeakersPanel();
-          })
-          .catch((e) => alert(String(e)));
+          .catch((e) => alert("Ошибка очистки баз: " + String(e)));
       });
     }
     $("labelOk").addEventListener("click", submitLabel);
@@ -1042,4 +1227,113 @@
         .catch(() => {});
     }, 1500);
   });
+  // ─── Архив игр ────────────────────────────────────────────────────────────
+
+  function openArchive() {
+    const overlay = $("archiveOverlay");
+    if (!overlay) return;
+    overlay.classList.remove("is-hidden");
+    const list = $("archiveList");
+    list.innerHTML = '<div class="archive-loading">Загрузка…</div>';
+
+    api("/api/games/sessions?limit=100")
+      .then((sessions) => {
+        list.innerHTML = "";
+        if (!Array.isArray(sessions) || sessions.length === 0) {
+          list.innerHTML = '<div class="archive-empty">Нет сохранённых игр</div>';
+          return;
+        }
+        sessions.forEach((s) => {
+          const item = document.createElement("div");
+          item.className = "archive-item";
+
+          const date = new Date(s.started_at);
+          const dateStr = date.toLocaleDateString("ru-RU", {
+            day: "2-digit", month: "2-digit", year: "numeric",
+            hour: "2-digit", minute: "2-digit",
+          });
+
+          const modeLabels = { ingest: "Обучение", file: "Файл", record: "Запись" };
+          const modeLabel = modeLabels[s.session_mode] || s.session_mode;
+          const fileName = s.source_filename ? " · " + s.source_filename : "";
+          const endedLabel = s.ended_at ? "" : " · идёт";
+
+          item.innerHTML =
+            '<div class="archive-item-meta">' +
+            '<span class="archive-item-date">' + escapeHtml(dateStr) + '</span>' +
+            '<span class="archive-item-mode">' + escapeHtml(modeLabel + fileName + endedLabel) + '</span>' +
+            '</div>' +
+            '<button type="button" class="archive-item-load">Открыть</button>';
+
+          item.querySelector(".archive-item-load").addEventListener("click", () => {
+            loadArchivedSession(s);
+          });
+
+          list.appendChild(item);
+        });
+      })
+      .catch((e) => {
+        list.innerHTML = '<div class="archive-empty">Ошибка загрузки: ' + escapeHtml(String(e)) + '</div>';
+      });
+  }
+
+  function closeArchive() {
+    const overlay = $("archiveOverlay");
+    if (overlay) overlay.classList.add("is-hidden");
+  }
+
+  function loadArchivedSession(sessionMeta) {
+    if (!confirm(
+      'Открыть игру от ' + new Date(sessionMeta.started_at).toLocaleString("ru-RU") + '?\n' +
+      'Текущий лог будет очищен.'
+    )) return;
+
+    closeArchive();
+
+    api("/api/games/sessions/" + encodeURIComponent(sessionMeta.id) + "/segments")
+      .then((segments) => {
+        if (!Array.isArray(segments)) throw new Error("bad response");
+
+        suppressLogPersist = true;
+        clearLog({ skipStorage: true });
+
+        state.gameSessionId = sessionMeta.id;
+        state.sourceFilename = sessionMeta.source_filename || "";
+        setSourceFileUi(state.sourceFilename);
+
+        // Восстановить hint в строке статуса
+        const hint = $("logRestoreHint");
+        if (hint) {
+          hint.hidden = false;
+          const date = new Date(sessionMeta.started_at).toLocaleString("ru-RU");
+          hint.textContent = "Архивная игра от " + date + " (режим редактирования, CUDA не нужна)";
+        }
+
+        segments.forEach((raw) => {
+          // Данные из БД уже имеют применённые overrides;
+          // _origSpeaker = speaker (исходник недоступен отдельно без join)
+          appendSegment({
+            type: "segment",
+            speaker: raw.speaker,
+            text: raw.text,
+            abs_start: raw.abs_start,
+            abs_end: raw.abs_end,
+            ts: raw.wall_time || "",
+            voice_id: raw.voice_id || "",
+            seq: raw.seq,
+            match_score: raw.match_score != null ? raw.match_score : null,
+            game_session_id: sessionMeta.id,
+            // _origSpeaker совпадает с speaker — данные уже «финальные»
+            _origSpeaker: raw.speaker,
+            _origVoiceId: raw.voice_id || "",
+          });
+        });
+
+        suppressLogPersist = false;
+        persistLogToStorage();
+        refreshSpeakersPanel();
+      })
+      .catch((e) => alert("Ошибка загрузки игры: " + String(e)));
+  }
+
 })();
