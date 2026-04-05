@@ -478,7 +478,7 @@ func handleSpeakerSplit(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
 			http.Error(w, "voice_id required", http.StatusBadRequest)
 			return
 		}
-		keptID, newID, err := vc.SplitVoice(body.VoiceID, nil, nil)
+		keptID, newIDs, err := vc.SplitVoice(body.VoiceID, nil, nil, nil)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -487,13 +487,13 @@ func handleSpeakerSplit(vc *voiceclient.Client, h *hub.Hub) http.HandlerFunc {
 			"type":     "voice_split",
 			"voice_id": body.VoiceID,
 			"kept_id":  keptID,
-			"new_id":   newID,
+			"new_ids":  newIDs,
 		})
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  "ok",
 			"kept_id": keptID,
-			"new_id":  newID,
+			"new_ids": newIDs,
 		})
 	}
 }

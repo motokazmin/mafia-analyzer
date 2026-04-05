@@ -16,11 +16,7 @@ log = logging.getLogger("voice")
 
 OrderMode = Literal["temporal", "longest_first"]
 
-# ── Параметры разделения слипшихся спикеров ───────────────────────────────────
-# Минимум сегментов в группе чтобы пытаться делить
 _SPLIT_MIN_SEGMENTS = 4
-# Если максимальное попарное косинусное расстояние внутри группы
-# превышает этот порог — считаем что там два голоса
 _SPLIT_DISTANCE_THRESHOLD = float(
     getattr(config, "SPLIT_DISTANCE_THRESHOLD", 0.18)
 )
@@ -106,18 +102,13 @@ def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
 def _split_group(
     indices: list[int],
     embeddings: dict[int, np.ndarray],
-) -> Optional[tuple[list[int], list[int]]]:
+) -> Optional[list[list[int]]]:
     """
-    Проверяет группу сегментов одного pyannote-спикера.
-    Если внутри неё обнаруживаются два голоса — возвращает два списка индексов.
-    Иначе возвращает None.
-
-    Алгоритм: агломеративная кластеризация с complete-linkage по косинусному расстоянию.
-    Делим только на 2 кластера (добавление третьего — слишком агрессивно).
+    Checks a pyannote speaker group for multiple voices using HDBSCAN.
+    Returns list of index groups if 2+ clusters found, else None.
     """
     embs = np.array([embeddings[i] for i in indices], dtype=np.float64)
 
-    # Быстрая проверка: если максимальное попарное расстояние мало — один голос
     n = len(embs)
     max_dist = 0.0
     for i in range(n):
@@ -129,71 +120,69 @@ def _split_group(
         return None
 
     log.info(
-        "split_merged_speakers: group of %d segs has max_dist=%.3f > %.3f — splitting",
+        "split_merged_speakers: group of %d segs has max_dist=%.3f > %.3f — running HDBSCAN",
         n, max_dist, _SPLIT_DISTANCE_THRESHOLD,
     )
 
-    # Агломеративная кластеризация sklearn (только CPU, очень быстро на N<50)
     try:
-        from sklearn.cluster import AgglomerativeClustering
+        import hdbscan as hdbscan_lib
+        from sklearn.metrics.pairwise import cosine_distances
     except ImportError:
-        log.warning("split_merged_speakers: sklearn not available, skipping split")
+        log.warning("split_merged_speakers: hdbscan/sklearn not available, skipping")
         return None
 
-    labels = AgglomerativeClustering(
-        n_clusters=2,
-        metric="cosine",
-        linkage="complete",
-    ).fit_predict(embs)
+    dist_mat = cosine_distances(embs).astype(np.float64)
+    labels = hdbscan_lib.HDBSCAN(
+        min_cluster_size=3,
+        metric="precomputed",
+        cluster_selection_method="eom",
+    ).fit_predict(dist_mat)
 
-    group_a = [indices[i] for i in range(n) if labels[i] == 0]
-    group_b = [indices[i] for i in range(n) if labels[i] == 1]
+    unique_clusters = sorted(set(labels) - {-1})
+    if len(unique_clusters) < 2:
+        log.info("split_merged_speakers: HDBSCAN found only 1 cluster, skipping")
+        return None
 
-    # Отклоняем если один из кластеров слишком маленький (< 2 сегментов)
-    if len(group_a) < 2 or len(group_b) < 2:
+    groups = [
+        [indices[i] for i, l in enumerate(labels) if l == cid]
+        for cid in unique_clusters
+    ]
+
+    if any(len(g) < 2 for g in groups):
         log.info(
-            "split_merged_speakers: split rejected — unbalanced clusters (%d / %d)",
-            len(group_a), len(group_b),
+            "split_merged_speakers: rejected — cluster too small: %s",
+            [len(g) for g in groups],
         )
         return None
 
     log.info(
-        "split_merged_speakers: split accepted — cluster_a=%d segs, cluster_b=%d segs",
-        len(group_a), len(group_b),
+        "split_merged_speakers: accepted — %d clusters, sizes %s (noise=%d)",
+        len(groups), [len(g) for g in groups], list(labels).count(-1),
     )
-    return group_a, group_b
+    return groups
 
 
 def split_merged_speakers(
     pyannote_groups: dict[str, list[int]],
     embeddings: dict[int, np.ndarray],
 ) -> dict[str, list[int]]:
-    """
-    Принимает группировку по меткам pyannote и словарь эмбеддингов.
-    Возвращает новую группировку где слипшиеся спикеры разделены.
-
-    pyannote_groups: { "SPEAKER_01": [idx1, idx2, ...], ... }
-    embeddings:      { idx: np.ndarray, ... }
-    """
     result: dict[str, list[int]] = {}
     split_count = 0
 
     for spk_label, indices in pyannote_groups.items():
-        # Фильтруем индексы у которых есть эмбеддинг
         valid = [i for i in indices if i in embeddings]
 
         if len(valid) < _SPLIT_MIN_SEGMENTS:
-            # Слишком мало сегментов — не пытаемся делить
             result[spk_label] = indices
             continue
 
-        split = _split_group(valid, embeddings)
-        if split is None:
+        groups = _split_group(valid, embeddings)
+        if groups is None:
             result[spk_label] = indices
         else:
-            group_a, group_b = split
-            result[spk_label] = group_a
-            result[spk_label + "_split_0"] = group_b
+            result[spk_label] = groups[0]
+            for k, g in enumerate(groups[1:]):
+                result[f"{spk_label}_split_{k}"] = g
             split_count += 1
 
     if split_count:
@@ -264,7 +253,6 @@ def remap_speakers(
         if not valid:
             continue
 
-        # Сортируем по длительности: сначала длинные (longest_first внутри группы)
         if is_full_file:
             valid.sort(
                 key=lambda i: segments[i]["end"] - segments[i]["start"],

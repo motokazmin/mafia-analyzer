@@ -311,9 +311,9 @@ func (c *Client) GetSplitCandidates() ([]SplitCandidate, error) {
 	return candidates, nil
 }
 
-// SplitVoice разбивает профиль voiceID на два.
-// clusterA/clusterB — опциональные индексы; если nil, Python пересчитает сам.
-func (c *Client) SplitVoice(voiceID string, clusterA, clusterB []int) (kept, created string, err error) {
+// SplitVoice разбивает профиль voiceID на N профилей.
+// Возвращает keptID (исходный профиль) и slice newIDs (новые профили).
+func (c *Client) SplitVoice(voiceID string, clusterA, clusterB []int, extraClusters [][]int) (keptID string, newIDs []string, err error) {
 	payload := map[string]interface{}{
 		"voice_id": voiceID,
 	}
@@ -323,39 +323,44 @@ func (c *Client) SplitVoice(voiceID string, clusterA, clusterB []int) (kept, cre
 	if clusterB != nil {
 		payload["cluster_b"] = clusterB
 	}
+	if len(extraClusters) > 0 {
+		payload["extra_clusters"] = extraClusters
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	req, err := http.NewRequest(http.MethodPost, c.BaseURL+"/voices/split", bytes.NewReader(b))
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", c.APIKey)
 	resp, err := c.Client.Do(req)
 	if err != nil {
-		return "", "", err
+		return "", nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("split: status %d: %s", resp.StatusCode, string(raw))
+		return "", nil, fmt.Errorf("split: status %d: %s", resp.StatusCode, string(raw))
 	}
 	var result struct {
 		Kept struct {
-			VoiceID     string `json:"voice_id"`
-			DisplayName string `json:"display_name"`
+			VoiceID string `json:"voice_id"`
 		} `json:"kept"`
-		New struct {
-			VoiceID     string `json:"voice_id"`
-			DisplayName string `json:"display_name"`
+		New []struct {
+			VoiceID string `json:"voice_id"`
 		} `json:"new"`
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
-		return "", "", fmt.Errorf("split: decode: %w", err)
+		return "", nil, fmt.Errorf("split: decode: %w", err)
 	}
-	return result.Kept.VoiceID, result.New.VoiceID, nil
+	ids := make([]string, 0, len(result.New))
+	for _, n := range result.New {
+		ids = append(ids, n.VoiceID)
+	}
+	return result.Kept.VoiceID, ids, nil
 }
 
 // DeleteVoiceSegments удаляет историю эмбеддингов профиля (сбрасывает детектор расхождения).

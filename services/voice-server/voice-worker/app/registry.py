@@ -20,10 +20,14 @@ log = logging.getLogger("voice")
 
 # Minimum stored segment embeddings before we attempt split analysis
 _SPLIT_ANALYSIS_MIN_EMBEDDINGS = 10
-# Intra-profile dispersion threshold: mean pairwise cosine distance to flag
+# Intra-profile dispersion threshold: max pairwise cosine distance to flag
 _SPLIT_DISPERSION_THRESHOLD = float(
     getattr(config, "SPLIT_DISTANCE_THRESHOLD", 0.18)
 )
+# HDBSCAN: minimum cluster size (smaller -> more sensitive to sub-clusters)
+_HDBSCAN_MIN_CLUSTER_SIZE = int(__import__("os").environ.get("HDBSCAN_MIN_CLUSTER_SIZE", "3"))
+# Sanity cap: ignore results with more clusters than this
+_SPLIT_MAX_CLUSTERS = int(__import__("os").environ.get("SPLIT_MAX_CLUSTERS", "4"))
 
 
 @dataclass
@@ -32,9 +36,17 @@ class SplitCandidate:
     display_name: str
     embedding_count: int
     max_pairwise_dist: float
-    # cluster_a / cluster_b: indices into the stored embeddings list
     cluster_a: list[int]
     cluster_b: list[int]
+    extra_clusters: list[list[int]] = None  # 3rd, 4th cluster if found
+
+    def __post_init__(self):
+        if self.extra_clusters is None:
+            self.extra_clusters = []
+
+    @property
+    def all_clusters(self) -> list[list[int]]:
+        return [self.cluster_a, self.cluster_b] + self.extra_clusters
 
 
 class VoiceRegistry:
@@ -158,12 +170,13 @@ class VoiceRegistry:
         """
         Analyse all profiles with enough stored embeddings.
         Returns SplitCandidate list for profiles whose embedding distribution
-        appears bimodal (two voices merged into one).
+        appears multimodal (2+ voices merged into one).
+        Uses HDBSCAN so the number of clusters is determined automatically.
         """
         try:
-            from sklearn.cluster import AgglomerativeClustering
+            import hdbscan as hdbscan_lib
         except ImportError:
-            log.warning("check_split_candidates: sklearn not available")
+            log.warning("check_split_candidates: hdbscan not installed (pip install hdbscan)")
             return []
 
         candidates: list[SplitCandidate] = []
@@ -176,7 +189,7 @@ class VoiceRegistry:
             mat = np.array(embs, dtype=np.float64)
             n = len(mat)
 
-            # Max pairwise cosine distance (sample up to 50 pairs for speed)
+            # Quick pre-check: max pairwise cosine distance (sample up to 200 pairs)
             max_dist = 0.0
             pairs_checked = 0
             for i in range(n):
@@ -198,38 +211,72 @@ class VoiceRegistry:
                 continue
 
             log.info(
-                "check_split_candidates: %s (%s) max_dist=%.3f — running clustering",
+                "check_split_candidates: %s (%s) max_dist=%.3f — running HDBSCAN",
                 profile.display_name, voice_id[:8], max_dist,
             )
 
-            labels = AgglomerativeClustering(
-                n_clusters=2,
-                metric="cosine",
-                linkage="complete",
-            ).fit_predict(mat)
+            # HDBSCAN on cosine distance matrix
+            # precompute_distances to use cosine metric correctly
+            from sklearn.metrics.pairwise import cosine_distances
+            dist_mat = cosine_distances(mat).astype(np.float64)
 
-            cluster_a = [i for i, l in enumerate(labels) if l == 0]
-            cluster_b = [i for i, l in enumerate(labels) if l == 1]
+            clusterer = hdbscan_lib.HDBSCAN(
+                min_cluster_size=_HDBSCAN_MIN_CLUSTER_SIZE,
+                metric="precomputed",
+                cluster_selection_method="eom",
+            )
+            labels = clusterer.fit_predict(dist_mat)
 
-            if len(cluster_a) < 2 or len(cluster_b) < 2:
+            unique_clusters = sorted(set(labels) - {-1})  # -1 = noise
+            n_clusters = len(unique_clusters)
+
+            if n_clusters < 2:
                 log.info(
-                    "check_split_candidates: %s rejected — unbalanced (%d/%d)",
-                    profile.display_name, len(cluster_a), len(cluster_b),
+                    "check_split_candidates: %s — only %d cluster(s) found, skipping",
+                    profile.display_name, n_clusters,
                 )
                 continue
 
+            if n_clusters > _SPLIT_MAX_CLUSTERS:
+                log.warning(
+                    "check_split_candidates: %s — %d clusters exceeds cap %d, skipping",
+                    profile.display_name, n_clusters, _SPLIT_MAX_CLUSTERS,
+                )
+                continue
+
+            # Build per-cluster index lists (exclude noise points)
+            clusters: list[list[int]] = [
+                [i for i, l in enumerate(labels) if l == cid]
+                for cid in unique_clusters
+            ]
+
+            # Require each cluster to have at least 2 points
+            if any(len(c) < 2 for c in clusters):
+                log.info(
+                    "check_split_candidates: %s rejected — cluster too small: %s",
+                    profile.display_name, [len(c) for c in clusters],
+                )
+                continue
+
+            log.info(
+                "check_split_candidates: %s FLAGGED — %d embs, max_dist=%.3f, "
+                "%d clusters: %s (noise=%d)",
+                profile.display_name, n, max_dist, n_clusters,
+                [len(c) for c in clusters],
+                list(labels).count(-1),
+            )
+
+            # Store first two clusters as cluster_a / cluster_b for the split API.
+            # If more than 2, the caller (split_voice) will handle all of them.
             candidates.append(SplitCandidate(
                 voice_id=voice_id,
                 display_name=profile.display_name,
                 embedding_count=n,
                 max_pairwise_dist=round(max_dist, 4),
-                cluster_a=cluster_a,
-                cluster_b=cluster_b,
+                cluster_a=clusters[0],
+                cluster_b=clusters[1],
+                extra_clusters=clusters[2:] if n_clusters > 2 else [],
             ))
-            log.info(
-                "check_split_candidates: %s FLAGGED — %d embs, max_dist=%.3f, clusters %d/%d",
-                profile.display_name, n, max_dist, len(cluster_a), len(cluster_b),
-            )
 
         return candidates
 
@@ -238,11 +285,16 @@ class VoiceRegistry:
         voice_id: str,
         cluster_a: list[int],
         cluster_b: list[int],
-    ) -> Optional[Tuple[SpeakerProfile, SpeakerProfile]]:
+        extra_clusters: Optional[list[list[int]]] = None,
+    ) -> Optional[list[SpeakerProfile]]:
         """
-        Split voice_id into two profiles based on pre-computed cluster indices
-        (indices into the stored segment_embeddings, oldest-first order).
-        Returns (kept_profile, new_profile) or None on failure.
+        Split voice_id into N profiles based on pre-computed cluster indices
+        (indices into stored segment_embeddings, oldest-first order).
+
+        cluster_a stays as the existing profile (updated centroid).
+        cluster_b + extra_clusters become new profiles.
+
+        Returns list of all resulting profiles (kept first) or None on failure.
         """
         embs = self.store.get_segment_embeddings(voice_id)
         if not embs:
@@ -254,40 +306,49 @@ class VoiceRegistry:
             log.warning("split_voice: voice_id %s not in profiles", voice_id)
             return None
 
+        all_clusters = [cluster_a, cluster_b] + (extra_clusters or [])
+
         def _centroid(indices: list[int]) -> np.ndarray:
-            vecs = np.array([embs[i] for i in indices if i < len(embs)], dtype=np.float64)
+            vecs = np.array(
+                [embs[i] for i in indices if i < len(embs)], dtype=np.float64
+            )
             if len(vecs) == 0:
                 return original.centroid.copy()
             c = vecs.mean(axis=0)
             n = float(np.linalg.norm(c))
             return c / n if n > 1e-8 else c
 
-        centroid_a = _centroid(cluster_a)
-        centroid_b = _centroid(cluster_b)
+        centroids = [_centroid(c) for c in all_clusters]
 
-        # Profile A: update existing voice in-place
+        # Profile 0: update existing voice in-place (cluster_a)
         self.store.update_voice(
             voice_id,
-            np.asarray(centroid_a, dtype=np.float32),
+            np.asarray(centroids[0], dtype=np.float32),
             segment_count_delta=0,
         )
-        original.centroid = centroid_a
+        original.centroid = centroids[0]
         original.segment_count = len(cluster_a)
+        result_profiles: list[SpeakerProfile] = [original]
 
-        # Profile B: new voice
-        n_counter = self.store.increment_speaker_counter()
-        new_name = f"{original.display_name}_2"
-        new_id = self.store.insert_voice(centroid_b, display_name=new_name)
-        new_profile = SpeakerProfile(new_id, centroid_b, new_name)
-        new_profile.segment_count = len(cluster_b)
-        self.profiles[new_id] = new_profile
+        # Profiles 1..N: create new voices for cluster_b + extra
+        for idx, (cluster_indices, centroid) in enumerate(
+            zip(all_clusters[1:], centroids[1:]), start=2
+        ):
+            self.store.increment_speaker_counter()
+            new_name = f"{original.display_name}_{idx}"
+            new_id = self.store.insert_voice(centroid, display_name=new_name)
+            new_profile = SpeakerProfile(new_id, centroid, new_name)
+            new_profile.segment_count = len(cluster_indices)
+            self.profiles[new_id] = new_profile
+            self.store.split_segment_embeddings(voice_id, new_id, cluster_indices)
+            result_profiles.append(new_profile)
 
-        # Reassign embeddings
-        self.store.split_segment_embeddings(voice_id, new_id, cluster_b)
-
+        cluster_sizes = [len(c) for c in all_clusters]
         log.info(
-            "split_voice: %s split into '%s' (%d segs) + '%s' (%d segs)",
-            voice_id[:8], original.display_name, len(cluster_a),
-            new_name, len(cluster_b),
+            "split_voice: %s split into %d profiles %s — sizes %s",
+            voice_id[:8],
+            len(result_profiles),
+            [p.display_name for p in result_profiles],
+            cluster_sizes,
         )
-        return original, new_profile
+        return result_profiles

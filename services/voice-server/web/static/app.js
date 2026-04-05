@@ -26,6 +26,7 @@
   const LOG_STORAGE_KEY = "mafia_voice_ui_log_v1";
   let suppressLogPersist = false;
   let persistDebounceTimer = null;
+  let _pendingSplitCandidates = []; // кэш кандидатов на разделение из voice_split_suggested
 
   function schedulePersistFromSegments() {
     if (suppressLogPersist) return;
@@ -337,11 +338,9 @@
       .catch(() => {});
   }
 
-  function applySplitVoice(keptId, newId) {
-    // Refresh speakers list and colour map; segments keep their current voice_id
-    // (kept_id stays as-is). The new profile has no segments in the current log
-    // yet — it will appear in the panel and future segments may use it.
+  function applySplitVoice(keptId, newIds) {
     state.splitCandidates.delete(keptId);
+    _pendingSplitCandidates = _pendingSplitCandidates.filter((c) => c.voice_id !== keptId);
     refreshSpeakersPanel();
     persistLogToStorage();
   }
@@ -432,9 +431,11 @@
         } else if (data.type === "data_reset") {
           clearLog();
           state.splitCandidates.clear();
+          _pendingSplitCandidates = [];
           refreshSpeakersPanel();
         } else if (data.type === "voice_split_suggested") {
           if (Array.isArray(data.candidates) && data.candidates.length > 0) {
+            _pendingSplitCandidates = data.candidates;
             data.candidates.forEach((c) => state.splitCandidates.add(c.voice_id));
             const names = data.candidates.map((c) => c.display_name || c.voice_id.slice(0, 8)).join(", ");
             const hint = $("logRestoreHint");
@@ -445,7 +446,7 @@
             refreshSpeakersPanel();
           }
         } else if (data.type === "voice_split") {
-          applySplitVoice(data.kept_id, data.new_id);
+          applySplitVoice(data.kept_id, data.new_ids || []);
         } else if (data.type === "voice_segments_cleared") {
           state.splitCandidates.delete(data.speaker_id);
           refreshSpeakersPanel();
@@ -950,13 +951,18 @@
 
           // ── Разделить голос (если есть предложение) ──────────────────
           if (state.splitCandidates.has(vid)) {
+            const candidate = (_pendingSplitCandidates || []).find((c) => c.voice_id === vid);
+            const nClusters = (candidate && candidate.n_clusters) ? candidate.n_clusters : 2;
+            const clusterSizes = (candidate && candidate.cluster_sizes)
+              ? candidate.cluster_sizes.join(" / ")
+              : "";
             const splitRow = document.createElement("div");
             splitRow.className = "speaker-split";
             const splitBtn = document.createElement("button");
             splitBtn.type = "button";
             splitBtn.className = "btn-split";
-            splitBtn.textContent = "🔀 Разделить на два голоса";
-            splitBtn.title = "Система обнаружила два разных голоса в этом профиле";
+            splitBtn.textContent = "🔀 Разделить на " + nClusters + " голоса" + (clusterSizes ? " (" + clusterSizes + " сег.)" : "");
+            splitBtn.title = "Система обнаружила " + nClusters + " разных голоса в этом профиле";
             splitBtn.addEventListener("click", () => {
               const displayTitle = labeled ? v.display_name : vid.slice(0, 8) + "…";
               if (!confirm(
@@ -973,11 +979,12 @@
               })
                 .then((res) => {
                   state.splitCandidates.delete(vid);
-                  applySplitVoice(res.kept_id, res.new_id);
+                  applySplitVoice(res.kept_id, res.new_ids || []);
+                  const n = (res.new_ids || []).length + 1;
                   const hint = $("logRestoreHint");
                   if (hint) {
                     hint.hidden = false;
-                    hint.textContent = "✓ Голос разделён. Новый профиль появился в панели.";
+                    hint.textContent = "✓ Голос разделён на " + n + " профиля. Переименуйте их в панели.";
                   }
                 })
                 .catch((err) => {
@@ -997,6 +1004,7 @@
               api("/api/speakers/" + encodeURIComponent(vid) + "/segments", { method: "DELETE" })
                 .then(() => {
                   state.splitCandidates.delete(vid);
+                  _pendingSplitCandidates = _pendingSplitCandidates.filter((c) => c.voice_id !== vid);
                   refreshSpeakersPanel();
                 })
                 .catch((err) => alert(String(err)));

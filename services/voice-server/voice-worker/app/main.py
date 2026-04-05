@@ -173,7 +173,6 @@ def _run_pipeline(
 def _process_job(job_id: str, path: str, reg: VoiceRegistry, **kwargs) -> None:
     t0 = time.monotonic()
     log.info("[job %s] started", job_id[:8])
-    is_full = kwargs.get("remap_order") == "longest_first"
     try:
         audio = whisperx.load_audio(path)
         duration = len(audio) / 16000
@@ -191,8 +190,8 @@ def _process_job(job_id: str, path: str, reg: VoiceRegistry, **kwargs) -> None:
             job_id[:8], time.monotonic() - t0, len(result.get("segments", [])),
         )
 
-        # After full-file processing: check for split candidates and cache suggestions
-        if is_full and result.get("segments"):
+        # After every successful job: check for split candidates and cache suggestions
+        if result.get("segments"):
             _refresh_split_suggestions(reg)
 
     except Exception as e:
@@ -217,6 +216,8 @@ def _refresh_split_suggestions(reg: VoiceRegistry) -> None:
                 "max_pairwise_dist": c.max_pairwise_dist,
                 "cluster_a_size": len(c.cluster_a),
                 "cluster_b_size": len(c.cluster_b),
+                "n_clusters": 2 + len(c.extra_clusters),
+                "cluster_sizes": [len(cl) for cl in c.all_clusters],
             }
             for c in candidates
         ]
@@ -250,9 +251,9 @@ class RenameBody(BaseModel):
 
 class SplitBody(BaseModel):
     voice_id: str
-    # Optional: if omitted, we re-run clustering on the stored embeddings
     cluster_a: Optional[list[int]] = None
     cluster_b: Optional[list[int]] = None
+    extra_clusters: Optional[list[list[int]]] = None
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
@@ -468,6 +469,7 @@ async def split_voice(
 
     cluster_a = body.cluster_a
     cluster_b = body.cluster_b
+    extra_clusters = body.extra_clusters or []
 
     # If clusters not supplied, run analysis now
     if cluster_a is None or cluster_b is None:
@@ -481,12 +483,14 @@ async def split_voice(
             )
         cluster_a = match.cluster_a
         cluster_b = match.cluster_b
+        extra_clusters = match.extra_clusters or []
 
-    result = reg.split_voice(voice_id, cluster_a, cluster_b)
-    if result is None:
+    profiles = reg.split_voice(voice_id, cluster_a, cluster_b, extra_clusters)
+    if profiles is None:
         raise HTTPException(status_code=500, detail="split_voice failed internally")
 
-    kept, new_p = result
+    kept = profiles[0]
+    new_profiles = profiles[1:]
 
     # Remove from pending suggestions
     _pending_split_suggestions = [
@@ -494,13 +498,16 @@ async def split_voice(
     ]
 
     log.info(
-        "POST /voices/split: %s → '%s' + '%s'",
-        voice_id[:8], kept.display_name, new_p.display_name,
+        "POST /voices/split: %s → %d profiles: %s",
+        voice_id[:8], len(profiles), [p.display_name for p in profiles],
     )
     return {
         "status": "ok",
         "kept": {"voice_id": kept.voice_id, "display_name": kept.display_name},
-        "new": {"voice_id": new_p.voice_id, "display_name": new_p.display_name},
+        "new": [
+            {"voice_id": p.voice_id, "display_name": p.display_name}
+            for p in new_profiles
+        ],
     }
 
 
