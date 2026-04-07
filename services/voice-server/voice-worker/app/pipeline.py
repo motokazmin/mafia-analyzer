@@ -51,14 +51,6 @@ class ModelHolder:
 
         compute_type = "float16" if self.device == "cuda" else "int8"
 
-        config.THRESHOLD_CONFIDENT_MATCH = 0.55
-        config.THRESHOLD_SOFT_MATCH      = 0.40
-        config.THRESHOLD_FORCE_NEW       = 0.25
-        config.SIMILARITY_UPDATE_MIN     = 0.45
-        config.PENDING_MATCH_THRESHOLD   = 0.35
-
-
-
         log.info("=" * 60)
         log.info("loading models — startup config:")
         log.info("  device           : %s", self.device.upper())

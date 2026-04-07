@@ -21,6 +21,7 @@
     gameSessionId: "",
     splitCandidates: new Set(), // voice_id профилей, предложенных к разделению
     highlightedVoiceId: null,  // voice_id залипшей подсветки
+    _speakerRefreshTimer: null,
   };
 
   const LOG_STORAGE_KEY = "mafia_voice_ui_log_v1";
@@ -343,40 +344,6 @@
     _pendingSplitCandidates = _pendingSplitCandidates.filter((c) => c.voice_id !== keptId);
     refreshSpeakersPanel();
     persistLogToStorage();
-  }
-
-  function setHighlight(voiceId) {
-    // Toggle: повторный клик на ту же карточку снимает подсветку
-    const next = state.highlightedVoiceId === voiceId ? null : voiceId;
-    state.highlightedVoiceId = next;
-
-    const logEl = $("log");
-    if (!next) {
-      logEl.classList.remove("has-highlight");
-      state.segments.forEach((seg) => {
-        const line = seg._line;
-        if (!line) return;
-        line.classList.remove("is-dimmed", "is-lit");
-      });
-    } else {
-      logEl.classList.add("has-highlight");
-      state.segments.forEach((seg) => {
-        const line = seg._line;
-        if (!line) return;
-        if (seg.voice_id === next) {
-          line.classList.add("is-lit");
-          line.classList.remove("is-dimmed");
-        } else {
-          line.classList.add("is-dimmed");
-          line.classList.remove("is-lit");
-        }
-      });
-    }
-
-    // Пометить активную карточку
-    document.querySelectorAll(".speaker-card").forEach((card) => {
-      card.classList.toggle("is-highlighted", !!next && card.dataset.voiceId === next);
-    });
   }
 
   function applySegmentOverrideWS(data) {
@@ -813,6 +780,14 @@
   }
 
   function refreshSpeakersPanel() {
+    const activeEl = document.activeElement;
+    const isEditing =
+      activeEl && activeEl.closest("#speakersCards input, #speakersCards select");
+    if (isEditing) {
+      clearTimeout(state._speakerRefreshTimer);
+      state._speakerRefreshTimer = setTimeout(refreshSpeakersPanel, 2000);
+      return;
+    }
     return api("/api/speakers")
       .then((list) => {
         const panel = $("speakersPanel");
@@ -837,13 +812,6 @@
           card.dataset.voiceId = vid;
           if (v.unreliable) card.classList.add("is-unreliable");
           if (state.highlightedVoiceId === vid) card.classList.add("is-highlight-active");
-          card.addEventListener("click", (e) => {
-            // Don't trigger on interactive children (buttons, inputs, selects)
-            if (e.target.closest("button, input, select, label")) return;
-            toggleLogHighlight(vid);
-          });
-          if (state.highlightedVoiceId === vid) card.classList.add("is-highlight-active");
-          card.dataset.voiceId = vid;
           card.addEventListener("click", (e) => {
             // Не перехватываем клики по интерактивным элементам внутри карточки
             if (e.target.closest("button, input, select, label, form")) return;
