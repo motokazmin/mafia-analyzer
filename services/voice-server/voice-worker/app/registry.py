@@ -21,16 +21,14 @@ log = logging.getLogger("voice")
 # Minimum stored segment embeddings before we attempt split analysis
 _SPLIT_ANALYSIS_MIN_EMBEDDINGS = 10
 # Intra-profile dispersion threshold: max pairwise cosine distance to flag
-_SPLIT_DISPERSION_THRESHOLD = float(
-    getattr(config, "SPLIT_DISTANCE_THRESHOLD", 0.18)
-)
+_SPLIT_DISPERSION_THRESHOLD = float(config.SPLIT_DISTANCE_THRESHOLD)
 # HDBSCAN: minimum cluster size (smaller -> more sensitive to sub-clusters)
-_HDBSCAN_MIN_CLUSTER_SIZE = int(__import__("os").environ.get("HDBSCAN_MIN_CLUSTER_SIZE", "3"))
+_HDBSCAN_MIN_CLUSTER_SIZE = config.HDBSCAN_MIN_CLUSTER_SIZE
 # Sanity cap: ignore results with more clusters than this
-_SPLIT_MAX_CLUSTERS = int(__import__("os").environ.get("SPLIT_MAX_CLUSTERS", "4"))
+_SPLIT_MAX_CLUSTERS = config.SPLIT_MAX_CLUSTERS
 
 # Через сколько confident-матчей пересчитывать суб-центроиды профиля
-_SUB_REBUILD_EVERY = int(__import__("os").environ.get("SUB_REBUILD_EVERY", "10"))
+_SUB_REBUILD_EVERY = config.SUB_REBUILD_EVERY
 
 
 @dataclass

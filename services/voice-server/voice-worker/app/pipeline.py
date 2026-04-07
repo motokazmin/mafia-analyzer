@@ -29,7 +29,7 @@ _WAVLM_MODEL = "microsoft/wavlm-base-plus-sv"
 _WESPEAKER_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
 
 # Переключатель: "wavlm" или "wespeaker"
-_EMBEDDING_BACKEND = __import__("os").environ.get("EMBEDDING_BACKEND", "wespeaker").lower()
+_EMBEDDING_BACKEND = config.EMBEDDING_BACKEND.strip().lower()
 
 
 class ModelHolder:

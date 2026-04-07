@@ -1,88 +1,82 @@
-import os
+"""Публичный API настроек: загрузка из YAML + env, обратная совместимость имён."""
+
+from __future__ import annotations
+
 from pathlib import Path
 
+from app.config_loader import load_voice_server_config, resolve_database_path, resolve_device
+from app.config_model import VoiceServerConfig
+
+_cfg: VoiceServerConfig = load_voice_server_config()
+
+# Пути и устройство (вычисляются после загрузки модели)
+DATABASE_PATH: Path = resolve_database_path(_cfg)
+DEVICE: str
+GPU_AVAILABLE: bool
+DEVICE, GPU_AVAILABLE = resolve_device(_cfg.device)
+
 # API
-API_KEY = os.environ.get("VOICE_SERVER_API_KEY", "barchik")
-MAX_FILE_SIZE_MB = int(os.environ.get("VOICE_SERVER_MAX_FILE_MB", "500"))
-
-# Paths
-_DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "voice_registry.sqlite"
-_GOOGLE_DRIVE_ROOT = Path("/content/drive/MyDrive")
-_DEFAULT_DRIVE_DB_DIR = _GOOGLE_DRIVE_ROOT / "mafia-voice"
-
-
-def _resolve_database_path() -> Path:
-    if os.environ.get("VOICE_SERVER_DB"):
-        return Path(os.environ["VOICE_SERVER_DB"])
-    use_drive = os.environ.get("VOICE_SERVER_USE_GOOGLE_DRIVE", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if use_drive and _GOOGLE_DRIVE_ROOT.is_dir():
-        return _DEFAULT_DRIVE_DB_DIR / "voice_registry.sqlite"
-    return _DEFAULT_DB
-
-
-DATABASE_PATH = _resolve_database_path()
-
-def _detect_device() -> tuple[str, bool]:
-    """Определяет устройство: приоритет явной переменной, затем наличие CUDA."""
-    if os.environ.get("VOICE_SERVER_DEVICE"):
-        dev = os.environ["VOICE_SERVER_DEVICE"].lower()
-        return dev, (dev == "cuda")
-    
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda", True
-    except ImportError:
-        pass
-    return "cpu", False
-
-DEVICE, GPU_AVAILABLE = _detect_device()
+API_KEY = _cfg.api_key
+MAX_FILE_SIZE_MB = _cfg.max_file_size_mb
 
 # Models
-WHISPER_MODEL = os.environ.get("VOICE_SERVER_WHISPER_MODEL", "large-v2")
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+WHISPER_MODEL = _cfg.whisper_model
+HF_TOKEN = _cfg.hf_token
 
-# Continual learning: update centroids on confident matches (streaming + full_file bootstrap)
-ENABLE_VOICE_LEARNING = os.environ.get("ENABLE_VOICE_LEARNING", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+ENABLE_VOICE_LEARNING = _cfg.enable_voice_learning
 
-# Пороги: пресет VOICE_THRESHOLD_PRESET=balanced|strict|loose задаёт базу; отдельные THRESHOLD_* переопределяют.
+# Пороги и сессия
+THRESHOLD_CONFIDENT_MATCH = _cfg.threshold_confident_match
+THRESHOLD_SOFT_MATCH = _cfg.threshold_soft_match
+THRESHOLD_FORCE_NEW = _cfg.threshold_force_new
+SIMILARITY_UPDATE_MIN = _cfg.similarity_update_min
+PENDING_MATCH_THRESHOLD = _cfg.pending_match_threshold
+SPLIT_DISTANCE_THRESHOLD = _cfg.split_distance_threshold
 
+CALIBRATION_WINDOW = _cfg.calibration_window
+MAX_EXTRA_SLOTS = _cfg.max_extra_slots
+MIN_SPEAKER_DURATION = _cfg.min_speaker_duration
+PENDING_MAX_CHUNKS = _cfg.pending_max_chunks
+EMBEDDING_BUFFER_SIZE = _cfg.embedding_buffer_size
 
-def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key)
-    if v is None or str(v).strip() == "":
-        return default
-    return float(v)
+MIN_LONG_SEGMENT_SEC = _cfg.min_long_segment_sec
 
+# Реестр / эмбеддинги / профили (раньше только через os.environ)
+EMBEDDING_BACKEND = _cfg.embedding_backend
+HDBSCAN_MIN_CLUSTER_SIZE = _cfg.hdbscan_min_cluster_size
+SPLIT_MAX_CLUSTERS = _cfg.split_max_clusters
+SUB_REBUILD_EVERY = _cfg.sub_rebuild_every
+SEGMENT_EMBEDDINGS_MAX = _cfg.segment_embeddings_max
+MAX_SUB_CENTROIDS = _cfg.max_sub_centroids
+SUB_MIN_CLUSTER_SIZE = _cfg.sub_min_cluster_size
 
-_preset = os.environ.get("VOICE_THRESHOLD_PRESET", "balanced").strip().lower()
-_bc, _bs, _bf = 0.75, 0.60, 0.45
-if _preset == "strict":
-    _bc, _bs, _bf = 0.82, 0.66, 0.38
-elif _preset == "loose":
-    _bc, _bs, _bf = 0.68, 0.54, 0.50
-
-# balanced / неизвестное значение — дефолты как в whisperx-WavLM-colab
-THRESHOLD_CONFIDENT_MATCH = _env_float("THRESHOLD_CONFIDENT_MATCH", _bc)
-THRESHOLD_SOFT_MATCH = _env_float("THRESHOLD_SOFT_MATCH", _bs)
-THRESHOLD_FORCE_NEW = _env_float("THRESHOLD_FORCE_NEW", _bf)
-SIMILARITY_UPDATE_MIN = _env_float("SIMILARITY_UPDATE_MIN", 0.65)
-PENDING_MATCH_THRESHOLD = _env_float("PENDING_MATCH_THRESHOLD", 0.55)
-SPLIT_DISTANCE_THRESHOLD = _env_float("SPLIT_DISTANCE_THRESHOLD", 0.22)
-
-CALIBRATION_WINDOW = float(os.environ.get("CALIBRATION_WINDOW_SEC", "300.0"))
-MAX_EXTRA_SLOTS = int(os.environ.get("MAX_EXTRA_SLOTS", "2"))
-MIN_SPEAKER_DURATION = float(os.environ.get("MIN_SPEAKER_DURATION", "1.0"))
-PENDING_MAX_CHUNKS = int(os.environ.get("PENDING_MAX_CHUNKS", "3"))
-EMBEDDING_BUFFER_SIZE = int(os.environ.get("EMBEDDING_BUFFER_SIZE", "10"))
-
-# Bootstrap: prefer segments at least this long when ordering (full_file mode)
-MIN_LONG_SEGMENT_SEC = float(os.environ.get("MIN_LONG_SEGMENT_SEC", "2.0"))
+__all__ = [
+    "VoiceServerConfig",
+    "DATABASE_PATH",
+    "DEVICE",
+    "GPU_AVAILABLE",
+    "API_KEY",
+    "MAX_FILE_SIZE_MB",
+    "WHISPER_MODEL",
+    "HF_TOKEN",
+    "ENABLE_VOICE_LEARNING",
+    "THRESHOLD_CONFIDENT_MATCH",
+    "THRESHOLD_SOFT_MATCH",
+    "THRESHOLD_FORCE_NEW",
+    "SIMILARITY_UPDATE_MIN",
+    "PENDING_MATCH_THRESHOLD",
+    "SPLIT_DISTANCE_THRESHOLD",
+    "CALIBRATION_WINDOW",
+    "MAX_EXTRA_SLOTS",
+    "MIN_SPEAKER_DURATION",
+    "PENDING_MAX_CHUNKS",
+    "EMBEDDING_BUFFER_SIZE",
+    "MIN_LONG_SEGMENT_SEC",
+    "EMBEDDING_BACKEND",
+    "HDBSCAN_MIN_CLUSTER_SIZE",
+    "SPLIT_MAX_CLUSTERS",
+    "SUB_REBUILD_EVERY",
+    "SEGMENT_EMBEDDINGS_MAX",
+    "MAX_SUB_CENTROIDS",
+    "SUB_MIN_CLUSTER_SIZE",
+]

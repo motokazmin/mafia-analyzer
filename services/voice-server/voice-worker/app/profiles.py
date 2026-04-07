@@ -13,13 +13,9 @@ from app import config
 log = logging.getLogger("voice")
 
 # Максимальное число суб-центроидов на профиль
-_MAX_SUB_CENTROIDS = int(
-    __import__("os").environ.get("MAX_SUB_CENTROIDS", "6")
-)
+_MAX_SUB_CENTROIDS = config.MAX_SUB_CENTROIDS
 # Минимум эмбеддингов в кластере чтобы создать суб-центроид
-_SUB_MIN_CLUSTER_SIZE = int(
-    __import__("os").environ.get("SUB_MIN_CLUSTER_SIZE", "3")
-)
+_SUB_MIN_CLUSTER_SIZE = config.SUB_MIN_CLUSTER_SIZE
 
 
 def peak_normalize(chunk: np.ndarray) -> np.ndarray:

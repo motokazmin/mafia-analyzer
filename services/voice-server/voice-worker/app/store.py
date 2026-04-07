@@ -31,10 +31,7 @@ def _ensure_parent(path: Path) -> None:
 
 
 # Maximum stored embeddings per voice profile (FIFO eviction)
-SEGMENT_EMBEDDINGS_MAX = int(
-    getattr(config, "SEGMENT_EMBEDDINGS_MAX", None) or
-    __import__("os").environ.get("SEGMENT_EMBEDDINGS_MAX", "100")
-)
+SEGMENT_EMBEDDINGS_MAX = config.SEGMENT_EMBEDDINGS_MAX
 
 
 class VoiceStore:
