@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"voice-server/internal/domain"
@@ -155,8 +156,37 @@ func SendIngestFull(vc *voiceclient.Client, numSpeakers int, onSegment func(doma
 	return nil
 }
 
+type recordedChunk struct {
+	data     []byte
+	index    int
+	absStart float64
+}
+
+// RunRecord records audio from the microphone and sends chunks to the voice worker.
+//
+// Recording is continuous: while the worker processes the previous chunk,
+// ffmpeg is already capturing the next one. A single consumer goroutine
+// preserves segment ordering. The channel buffer (3) absorbs spikes in
+// processing latency without blocking the recording loop.
 func RunRecord(ctx context.Context, vc *voiceclient.Client, numSpeakers int, onSegment func(domain.Segment)) {
 	recordStart := time.Now()
+
+	pending := make(chan recordedChunk, 3)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for chunk := range pending {
+			SendChunk(vc, numSpeakers, onSegment, chunk.data, chunk.index, chunk.absStart)
+		}
+	}()
+
+	defer func() {
+		close(pending)
+		wg.Wait()
+	}()
+
 	for i := 0; ; i++ {
 		select {
 		case <-ctx.Done():
@@ -185,7 +215,14 @@ func RunRecord(ctx context.Context, vc *voiceclient.Client, numSpeakers int, onS
 			log.Printf("ffmpeg chunk %d: %v", i, err)
 			continue
 		}
-		SendChunk(vc, numSpeakers, onSegment, data, i, absStart)
+
+		select {
+		case pending <- recordedChunk{data: data, index: i, absStart: absStart}:
+			log.Printf("[record] chunk %d queued (%.1fs audio, pending=%d)",
+				i, float64(len(data))/(16000*2), len(pending))
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
