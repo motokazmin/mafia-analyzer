@@ -29,6 +29,9 @@ _HDBSCAN_MIN_CLUSTER_SIZE = int(__import__("os").environ.get("HDBSCAN_MIN_CLUSTE
 # Sanity cap: ignore results with more clusters than this
 _SPLIT_MAX_CLUSTERS = int(__import__("os").environ.get("SPLIT_MAX_CLUSTERS", "4"))
 
+# Через сколько confident-матчей пересчитывать суб-центроиды профиля
+_SUB_REBUILD_EVERY = int(__import__("os").environ.get("SUB_REBUILD_EVERY", "10"))
+
 
 @dataclass
 class SplitCandidate:
@@ -38,7 +41,7 @@ class SplitCandidate:
     max_pairwise_dist: float
     cluster_a: list[int]
     cluster_b: list[int]
-    extra_clusters: list[list[int]] = None  # 3rd, 4th cluster if found
+    extra_clusters: list[list[int]] = None
 
     def __post_init__(self):
         if self.extra_clusters is None:
@@ -56,18 +59,28 @@ class VoiceRegistry:
         self.session_max_speakers: Optional[int] = None
         self.session_start_time: float = time.time()
         self.pending_pool: list = []
+        # Счётчик матчей с момента последнего rebuild суб-центроидов (per voice_id)
+        self._match_counts: dict[str, int] = {}
         self.load_from_store()
 
     def load_from_store(self) -> None:
         self.profiles.clear()
         for row in self.store.list_voices():
             label = row.display_name or f"voice_{row.voice_id[:8]}"
-            self.profiles[row.voice_id] = SpeakerProfile(
+            p = SpeakerProfile(
                 row.voice_id,
                 row.centroid.astype(np.float64),
                 label,
             )
-            self.profiles[row.voice_id].segment_count = row.segment_count
+            p.segment_count = row.segment_count
+            # Загружаем суб-центроиды из БД
+            p.sub_centroids = self.store.load_sub_centroids(row.voice_id)
+            self.profiles[row.voice_id] = p
+            if p.sub_centroids:
+                log.info(
+                    "registry: загружен %s (%s) с %d суб-центроидами",
+                    label, row.voice_id[:8], len(p.sub_centroids),
+                )
 
         persisted = self.store.load_session_max_speakers()
         if persisted is not None and self.session_max_speakers is None:
@@ -80,6 +93,7 @@ class VoiceRegistry:
         self.store.save_session_max_speakers(None)
         self.session_start_time = time.time()
         self.pending_pool = []
+        self._match_counts.clear()
 
     def _is_calibration_phase(self) -> bool:
         elapsed = time.time() - self.session_start_time
@@ -114,6 +128,29 @@ class VoiceRegistry:
             segment_count_delta=1,
         )
 
+    def _maybe_rebuild_sub_centroids(self, profile: SpeakerProfile) -> None:
+        """
+        После каждых _SUB_REBUILD_EVERY матчей с этим профилем запускает
+        rebuild_sub_centroids() и сохраняет результат в БД.
+        """
+        vid = profile.voice_id
+        self._match_counts[vid] = self._match_counts.get(vid, 0) + 1
+        if self._match_counts[vid] < _SUB_REBUILD_EVERY:
+            return
+        self._match_counts[vid] = 0
+
+        embs = self.store.get_segment_embeddings(vid)
+        if not embs:
+            return
+
+        rebuilt = profile.rebuild_sub_centroids(embs)
+        if rebuilt:
+            self.store.save_sub_centroids(vid, profile.sub_centroids)
+            log.info(
+                "krv multipole: %s → %d суб-центроидов пересчитано и сохранено",
+                profile.display_name, len(profile.sub_centroids),
+            )
+
     def set_session_max_speakers(self, value: int) -> None:
         self.session_max_speakers = value
         self.store.save_session_max_speakers(value)
@@ -122,37 +159,92 @@ class VoiceRegistry:
         emb = np.asarray(embedding, dtype=np.float64)
         best_profile: Optional[SpeakerProfile] = None
         best_sim = -1.0
+
+        all_sims: list[tuple[str, float]] = []
         for profile in self.profiles.values():
             sim = profile.vote_similarity(emb)
+            all_sims.append((profile.display_name, sim))
             if sim > best_sim:
                 best_sim, best_profile = sim, profile
 
         calibration = self._is_calibration_phase()
+        elapsed = time.time() - self.session_start_time
+
+        # ── krv diagnostic log ────────────────────────────────────────────
+        all_sims_str = "  ".join(
+            f"{name}={s:.3f}" for name, s in sorted(all_sims, key=lambda x: -x[1])
+        )
+        log.info(
+            "krv match_or_register: profiles=%d  calibration=%s  elapsed=%.0fs  "
+            "session_max=%s  best=%s  best_sim=%.3f  "
+            "thr[confident=%.2f  soft=%.2f  force_new=%.2f]  all=[%s]",
+            len(self.profiles),
+            calibration,
+            elapsed,
+            self.session_max_speakers,
+            best_profile.display_name if best_profile else "none",
+            best_sim,
+            config.THRESHOLD_CONFIDENT_MATCH,
+            config.THRESHOLD_SOFT_MATCH,
+            config.THRESHOLD_FORCE_NEW,
+            all_sims_str,
+        )
+        # ─────────────────────────────────────────────────────────────────
 
         if best_sim >= config.THRESHOLD_CONFIDENT_MATCH and best_profile is not None:
+            log.info(
+                "krv match_or_register: → CONFIDENT MATCH → %s (sim=%.3f, subs=%d)",
+                best_profile.display_name, best_sim, len(best_profile.sub_centroids),
+            )
             best_profile.update(emb, best_sim)
             self.persist_centroid(best_profile)
+            self._maybe_rebuild_sub_centroids(best_profile)
             return best_profile, float(best_sim)
 
         if config.THRESHOLD_SOFT_MATCH <= best_sim < config.THRESHOLD_CONFIDENT_MATCH:
             if calibration:
+                log.info(
+                    "krv match_or_register: → SOFT+CALIBRATION → NEW PROFILE (sim=%.3f)",
+                    best_sim,
+                )
                 p = self.register_new(emb)
                 return p, float(best_sim)
+            log.info(
+                "krv match_or_register: → SOFT ASSIGN → %s (sim=%.3f)",
+                best_profile.display_name, best_sim,
+            )
             assert best_profile is not None
             best_profile.soft_assign(emb)
             return best_profile, float(best_sim)
 
         if best_sim < config.THRESHOLD_FORCE_NEW:
             if self._extra_slots_available():
+                log.info(
+                    "krv match_or_register: → FORCE NEW (sim=%.3f < %.2f, slots available)",
+                    best_sim, config.THRESHOLD_FORCE_NEW,
+                )
                 p = self.register_new(emb)
                 return p, float(best_sim)
+            log.info(
+                "krv match_or_register: → FORCE NEW but no slots → SOFT ASSIGN → %s (sim=%.3f)",
+                best_profile.display_name, best_sim,
+            )
             assert best_profile is not None
             best_profile.soft_assign(emb)
             return best_profile, float(best_sim)
 
         if calibration:
+            log.info(
+                "krv match_or_register: → CALIBRATION FALLBACK → NEW PROFILE (sim=%.3f)",
+                best_sim,
+            )
             p = self.register_new(emb)
             return p, float(best_sim)
+
+        log.info(
+            "krv match_or_register: → FALLBACK SOFT ASSIGN → %s (sim=%.3f)",
+            best_profile.display_name, best_sim,
+        )
         assert best_profile is not None
         best_profile.soft_assign(emb)
         return best_profile, float(best_sim)
@@ -163,6 +255,26 @@ class VoiceRegistry:
         if voice_id in self.profiles:
             self.profiles[voice_id].display_name = name
         return True
+
+    # ── Принудительный rebuild суб-центроидов для всех профилей ───────────
+
+    def rebuild_all_sub_centroids(self) -> dict[str, int]:
+        """
+        Пересчитывает суб-центроиды для всех профилей немедленно.
+        Возвращает {voice_id: n_subs}.
+        Удобно вызывать вручную после bootstrap или после wipe+re-import.
+        """
+        result = {}
+        for vid, profile in self.profiles.items():
+            embs = self.store.get_segment_embeddings(vid)
+            if not embs:
+                continue
+            rebuilt = profile.rebuild_sub_centroids(embs)
+            if rebuilt:
+                self.store.save_sub_centroids(vid, profile.sub_centroids)
+                result[vid] = len(profile.sub_centroids)
+        log.info("rebuild_all_sub_centroids: обновлено %d профилей", len(result))
+        return result
 
     # ── Split candidate detection ──────────────────────────────────────────
 
@@ -215,8 +327,6 @@ class VoiceRegistry:
                 profile.display_name, voice_id[:8], max_dist,
             )
 
-            # HDBSCAN on cosine distance matrix
-            # precompute_distances to use cosine metric correctly
             from sklearn.metrics.pairwise import cosine_distances
             dist_mat = cosine_distances(mat).astype(np.float64)
 
@@ -227,7 +337,7 @@ class VoiceRegistry:
             )
             labels = clusterer.fit_predict(dist_mat)
 
-            unique_clusters = sorted(set(labels) - {-1})  # -1 = noise
+            unique_clusters = sorted(set(labels) - {-1})
             n_clusters = len(unique_clusters)
 
             if n_clusters < 2:
@@ -244,13 +354,11 @@ class VoiceRegistry:
                 )
                 continue
 
-            # Build per-cluster index lists (exclude noise points)
             clusters: list[list[int]] = [
                 [i for i, l in enumerate(labels) if l == cid]
                 for cid in unique_clusters
             ]
 
-            # Require each cluster to have at least 2 points
             if any(len(c) < 2 for c in clusters):
                 log.info(
                     "check_split_candidates: %s rejected — cluster too small: %s",
@@ -266,8 +374,6 @@ class VoiceRegistry:
                 list(labels).count(-1),
             )
 
-            # Store first two clusters as cluster_a / cluster_b for the split API.
-            # If more than 2, the caller (split_voice) will handle all of them.
             candidates.append(SplitCandidate(
                 voice_id=voice_id,
                 display_name=profile.display_name,
@@ -288,12 +394,9 @@ class VoiceRegistry:
         extra_clusters: Optional[list[list[int]]] = None,
     ) -> Optional[list[SpeakerProfile]]:
         """
-        Split voice_id into N profiles based on pre-computed cluster indices
-        (indices into stored segment_embeddings, oldest-first order).
-
+        Split voice_id into N profiles based on pre-computed cluster indices.
         cluster_a stays as the existing profile (updated centroid).
         cluster_b + extra_clusters become new profiles.
-
         Returns list of all resulting profiles (kept first) or None on failure.
         """
         embs = self.store.get_segment_embeddings(voice_id)
@@ -328,6 +431,9 @@ class VoiceRegistry:
         )
         original.centroid = centroids[0]
         original.segment_count = len(cluster_a)
+        # Сбрасываем суб-центроиды — пересчитаются автоматически после матчей
+        original.sub_centroids = []
+        self.store.delete_sub_centroids(voice_id)
         result_profiles: list[SpeakerProfile] = [original]
 
         # Profiles 1..N: create new voices for cluster_b + extra

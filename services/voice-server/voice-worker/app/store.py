@@ -98,6 +98,23 @@ class VoiceStore:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_se_voice_id ON segment_embeddings(voice_id)"
         )
+        # ── Новая таблица: суб-центроиды мультидиполя ─────────────────────
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_sub_centroids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voice_id TEXT NOT NULL REFERENCES voices(voice_id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                centroid BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(voice_id, idx)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vsc_voice_id ON voice_sub_centroids(voice_id)"
+        )
         conn.commit()
         # Seed meta keys if missing
         for key, default in [("speaker_counter", "0"), ("session_max_speakers", "")]:
@@ -150,7 +167,7 @@ class VoiceStore:
             finally:
                 conn.close()
 
-    # ── session_max_speakers persistence (#3) ─────────────────────────────
+    # ── session_max_speakers persistence ──────────────────────────────────
 
     def save_session_max_speakers(self, value: Optional[int]) -> None:
         stored = str(value) if value is not None else ""
@@ -179,6 +196,59 @@ class VoiceStore:
                     except ValueError:
                         return None
                 return None
+            finally:
+                conn.close()
+
+    # ── sub_centroids (мультидиполь) ───────────────────────────────────────
+
+    def save_sub_centroids(self, voice_id: str, sub_centroids: list[np.ndarray]) -> None:
+        """Сохраняет список суб-центроидов. Перезаписывает все предыдущие."""
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id = ?", (voice_id,)
+                )
+                for idx, vec in enumerate(sub_centroids):
+                    arr = np.asarray(vec, dtype=np.float32).ravel()
+                    conn.execute(
+                        """
+                        INSERT INTO voice_sub_centroids (voice_id, idx, centroid, dim, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (voice_id, idx, arr.tobytes(), arr.shape[0], now),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def load_sub_centroids(self, voice_id: str) -> list[np.ndarray]:
+        """Загружает суб-центроиды в порядке idx."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT centroid, dim FROM voice_sub_centroids "
+                    "WHERE voice_id = ? ORDER BY idx ASC",
+                    (voice_id,),
+                ).fetchall()
+                result = []
+                for row in rows:
+                    arr = np.frombuffer(row["centroid"], dtype=np.float32).reshape(int(row["dim"]))
+                    result.append(arr.astype(np.float64))
+                return result
+            finally:
+                conn.close()
+
+    def delete_sub_centroids(self, voice_id: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id = ?", (voice_id,)
+                )
+                conn.commit()
             finally:
                 conn.close()
 
@@ -445,6 +515,7 @@ class VoiceStore:
             conn = self._connect()
             try:
                 conn.execute("DELETE FROM segment_embeddings")
+                conn.execute("DELETE FROM voice_sub_centroids")
                 conn.execute("DELETE FROM voices")
                 conn.execute(
                     "UPDATE meta SET value = '0' WHERE key = 'speaker_counter'"
@@ -460,7 +531,7 @@ class VoiceStore:
         with self._lock:
             conn = self._connect()
             try:
-                # segment_embeddings удаляются каскадно (ON DELETE CASCADE)
+                # segment_embeddings и voice_sub_centroids удаляются каскадно
                 cur = conn.execute("DELETE FROM voices WHERE voice_id = ?", (voice_id,))
                 conn.commit()
                 return cur.rowcount > 0
@@ -497,6 +568,11 @@ class VoiceStore:
                 conn.execute(
                     "UPDATE segment_embeddings SET voice_id = ? WHERE voice_id = ?",
                     (target_id, source_id),
+                )
+                # Удаляем суб-центроиды обоих — registry пересчитает после merge
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id IN (?, ?)",
+                    (source_id, target_id),
                 )
                 conn.execute(
                     """

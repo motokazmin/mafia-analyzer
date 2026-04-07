@@ -1,397 +1,588 @@
-package gamedb
+"""SQLite persistence for voice centroids and display names."""
 
-import (
-	"database/sql"
-	"errors"
-	"fmt"
-	"strings"
-	"time"
+from __future__ import annotations
 
-	"github.com/google/uuid"
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
 
-	"voice-server/internal/domain"
+import numpy as np
 
-	_ "modernc.org/sqlite"
+from app import config
+
+
+@dataclass
+class VoiceRow:
+    voice_id: str
+    display_name: Optional[str]
+    centroid: np.ndarray
+    segment_count: int
+    created_at: float
+    updated_at: float
+    unreliable: bool = False
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# Maximum stored embeddings per voice profile (FIFO eviction)
+SEGMENT_EMBEDDINGS_MAX = int(
+    getattr(config, "SEGMENT_EMBEDDINGS_MAX", None) or
+    __import__("os").environ.get("SEGMENT_EMBEDDINGS_MAX", "100")
 )
 
-// CaptureSource — откуда бралась речь (для анализа: файл vs живая игра).
-type CaptureSource string
 
-const (
-	CaptureSourceFile       CaptureSource = "file"       // загруженный/прогнанный файл
-	CaptureSourceMicrophone CaptureSource = "microphone" // микрофон
-)
+class VoiceStore:
+    """Thread-safe SQLite store for speaker embeddings."""
 
-// SessionMode — режим gateway (ingest / chunked file / live).
-type SessionMode string
+    def __init__(self, db_path: Path | None = None) -> None:
+        self._path = Path(db_path or config.DATABASE_PATH)
+        _ensure_parent(self._path)
+        self._lock = threading.Lock()
+        with self._lock:
+            conn = self._connect()
+            conn.close()
 
-const (
-	SessionModeIngest SessionMode = "ingest" // полный файл, обучение
-	SessionModeFile   SessionMode = "file"   // чанки по файлу
-	SessionModeRecord SessionMode = "record" // микрофон
-)
+    def _migrate_voices_schema(self, conn: sqlite3.Connection) -> None:
+        cur = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='voices'"
+        )
+        if cur.fetchone() is None:
+            return
+        cur = conn.execute("PRAGMA table_info(voices)")
+        cols = {str(r[1]) for r in cur.fetchall()}
+        if "flag_unreliable" not in cols:
+            conn.execute(
+                "ALTER TABLE voices ADD COLUMN flag_unreliable INTEGER NOT NULL DEFAULT 0"
+            )
 
-// SessionMeta — метаданные партии для последующего анализа (структура игры, поведение).
-type SessionMeta struct {
-	CaptureSource  CaptureSource
-	SessionMode    SessionMode
-	SpeakersHint   int
-	SourceFilename string // базовое имя файла, если применимо
-}
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voices (
+                voice_id TEXT PRIMARY KEY,
+                display_name TEXT,
+                centroid BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                segment_count INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS segment_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voice_id TEXT NOT NULL REFERENCES voices(voice_id) ON DELETE CASCADE,
+                session_id TEXT,
+                embedding BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_se_voice_id ON segment_embeddings(voice_id)"
+        )
+        # ── Новая таблица: суб-центроиды мультидиполя ─────────────────────
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS voice_sub_centroids (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voice_id TEXT NOT NULL REFERENCES voices(voice_id) ON DELETE CASCADE,
+                idx INTEGER NOT NULL,
+                centroid BLOB NOT NULL,
+                dim INTEGER NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(voice_id, idx)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vsc_voice_id ON voice_sub_centroids(voice_id)"
+        )
+        conn.commit()
+        # Seed meta keys if missing
+        for key, default in [("speaker_counter", "0"), ("session_max_speakers", "")]:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)", (key, default)
+                )
+        self._migrate_voices_schema(conn)
+        conn.commit()
 
-// SessionRow — партия для API / экспорта.
-type SessionRow struct {
-	ID             string     `json:"id"`
-	StartedAt      time.Time  `json:"started_at"`
-	EndedAt        *time.Time `json:"ended_at,omitempty"`
-	CaptureSource  string     `json:"capture_source"`
-	SessionMode    string     `json:"session_mode"`
-	SpeakersHint   *int       `json:"speakers_hint,omitempty"`
-	SourceFilename string     `json:"source_filename,omitempty"`
-}
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        self._ensure_schema(conn)
+        return conn
 
-// SegmentRow — реплика в БД.
-type SegmentRow struct {
-	ID              int64    `json:"id"`
-	SessionID       string   `json:"session_id"`
-	Seq             int      `json:"seq"`
-	Speaker         string   `json:"speaker"`
-	VoiceID         string   `json:"voice_id,omitempty"`
-	Text            string   `json:"text"`
-	AbsStart        float64  `json:"abs_start"`
-	AbsEnd          float64  `json:"abs_end"`
-	WallTime        string   `json:"wall_time"`
-	MatchScore      *float64 `json:"match_score,omitempty"`
-	OverrideApplied bool     `json:"override_applied,omitempty"`
-}
+    # ── speaker counter ────────────────────────────────────────────────────
 
-// Store — SQLite: партии и реплики (отдельно от реестра голосов на Python).
-type Store struct {
-	db *sql.DB
-}
+    def get_speaker_counter(self) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'speaker_counter'"
+                ).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
 
-// Open открывает или создаёт файл БД, применяет схему.
-func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
-	if err != nil {
-		return nil, err
-	}
-	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
-	if err := s.migrate(); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return s, nil
-}
+    def increment_speaker_counter(self) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = int(
+                    conn.execute(
+                        "SELECT value FROM meta WHERE key = 'speaker_counter'"
+                    ).fetchone()[0]
+                )
+                cur += 1
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'speaker_counter'",
+                    (str(cur),),
+                )
+                conn.commit()
+                return cur
+            finally:
+                conn.close()
 
-func (s *Store) Close() error {
-	return s.db.Close()
-}
+    # ── session_max_speakers persistence ──────────────────────────────────
 
-func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS game_sessions (
-	id TEXT PRIMARY KEY,
-	started_at TEXT NOT NULL,
-	ended_at TEXT,
-	capture_source TEXT NOT NULL CHECK (capture_source IN ('file', 'microphone')),
-	session_mode TEXT NOT NULL CHECK (session_mode IN ('ingest', 'file', 'record')),
-	speakers_hint INTEGER,
-	source_filename TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_game_sessions_started ON game_sessions(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_game_sessions_mode ON game_sessions(session_mode);
-CREATE INDEX IF NOT EXISTS idx_game_sessions_source ON game_sessions(capture_source);
+    def save_session_max_speakers(self, value: Optional[int]) -> None:
+        stored = str(value) if value is not None else ""
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('session_max_speakers', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (stored,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-CREATE TABLE IF NOT EXISTS game_segments (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	session_id TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
-	seq INTEGER NOT NULL,
-	speaker TEXT NOT NULL,
-	voice_id TEXT,
-	text TEXT NOT NULL,
-	abs_start REAL NOT NULL,
-	abs_end REAL NOT NULL,
-	wall_time TEXT NOT NULL,
-	UNIQUE (session_id, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_game_segments_session ON game_segments(session_id);
-`)
-	if err != nil {
-		return err
-	}
-	return s.migrateV2()
-}
+    def load_session_max_speakers(self) -> Optional[int]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'session_max_speakers'"
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        return int(row[0])
+                    except ValueError:
+                        return None
+                return None
+            finally:
+                conn.close()
 
-func (s *Store) migrateV2() error {
-	if _, err := s.db.Exec(`ALTER TABLE game_segments ADD COLUMN match_score REAL`); err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return err
-		}
-	}
-	_, err := s.db.Exec(`
-CREATE TABLE IF NOT EXISTS game_segment_overrides (
-	session_id TEXT NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
-	seq INTEGER NOT NULL,
-	speaker TEXT NOT NULL,
-	voice_id TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	PRIMARY KEY (session_id, seq)
-);
-CREATE INDEX IF NOT EXISTS idx_seg_overrides_session ON game_segment_overrides(session_id);
-`)
-	return err
-}
+    # ── sub_centroids (мультидиполь) ───────────────────────────────────────
 
-// CreateSession создаёт партию и возвращает id.
-func (s *Store) CreateSession(meta SessionMeta) (string, error) {
-	id := uuid.New().String()
-	now := time.Now().UTC().Format(time.RFC3339)
-	var fn sql.NullString
-	if meta.SourceFilename != "" {
-		fn = sql.NullString{String: meta.SourceFilename, Valid: true}
-	}
-	var sh sql.NullInt64
-	if meta.SpeakersHint > 0 {
-		sh = sql.NullInt64{Int64: int64(meta.SpeakersHint), Valid: true}
-	}
-	_, err := s.db.Exec(
-		`INSERT INTO game_sessions (id, started_at, capture_source, session_mode, speakers_hint, source_filename)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		id, now, string(meta.CaptureSource), string(meta.SessionMode), sh, fn,
-	)
-	if err != nil {
-		return "", err
-	}
-	return id, nil
-}
+    def save_sub_centroids(self, voice_id: str, sub_centroids: list[np.ndarray]) -> None:
+        """Сохраняет список суб-центроидов. Перезаписывает все предыдущие."""
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id = ?", (voice_id,)
+                )
+                for idx, vec in enumerate(sub_centroids):
+                    arr = np.asarray(vec, dtype=np.float32).ravel()
+                    conn.execute(
+                        """
+                        INSERT INTO voice_sub_centroids (voice_id, idx, centroid, dim, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (voice_id, idx, arr.tobytes(), arr.shape[0], now),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
 
-// EndSession проставляет ended_at.
-func (s *Store) EndSession(sessionID string) error {
-	if sessionID == "" {
-		return nil
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.Exec(`UPDATE game_sessions SET ended_at = ? WHERE id = ? AND ended_at IS NULL`, now, sessionID)
-	return err
-}
+    def load_sub_centroids(self, voice_id: str) -> list[np.ndarray]:
+        """Загружает суб-центроиды в порядке idx."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT centroid, dim FROM voice_sub_centroids "
+                    "WHERE voice_id = ? ORDER BY idx ASC",
+                    (voice_id,),
+                ).fetchall()
+                result = []
+                for row in rows:
+                    arr = np.frombuffer(row["centroid"], dtype=np.float32).reshape(int(row["dim"]))
+                    result.append(arr.astype(np.float64))
+                return result
+            finally:
+                conn.close()
 
-// InsertSegment сохраняет реплику в порядке следования.
-func (s *Store) InsertSegment(sessionID string, seq int, seg domain.Segment, wallTime string) error {
-	if sessionID == "" {
-		return nil
-	}
-	var vid interface{}
-	if seg.VoiceID != "" {
-		vid = seg.VoiceID
-	}
-	var ms interface{}
-	if seg.MatchScore != nil {
-		ms = *seg.MatchScore
-	}
-	_, err := s.db.Exec(
-		`INSERT INTO game_segments (session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time, match_score)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sessionID, seq, seg.Speaker, vid, seg.Text, seg.AbsStart, seg.AbsEnd, wallTime, ms,
-	)
-	return err
-}
+    def delete_sub_centroids(self, voice_id: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id = ?", (voice_id,)
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-// UpsertSegmentOverride — ручное назначение спикера для реплики (seq в рамках партии).
-func (s *Store) UpsertSegmentOverride(sessionID string, seq int, speaker, voiceID string) error {
-	if sessionID == "" {
-		return nil
-	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.Exec(`
-		INSERT INTO game_segment_overrides (session_id, seq, speaker, voice_id, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(session_id, seq) DO UPDATE SET
-			speaker = excluded.speaker,
-			voice_id = excluded.voice_id,
-			updated_at = excluded.updated_at`,
-		sessionID, seq, speaker, voiceID, now,
-	)
-	return err
-}
+    # ── segment_embeddings ─────────────────────────────────────────────────
 
-// DeleteSegmentOverride снимает ручное назначение.
-func (s *Store) DeleteSegmentOverride(sessionID string, seq int) error {
-	if sessionID == "" {
-		return nil
-	}
-	_, err := s.db.Exec(
-		`DELETE FROM game_segment_overrides WHERE session_id = ? AND seq = ?`,
-		sessionID, seq,
-	)
-	return err
-}
+    def add_segment_embedding(
+        self,
+        voice_id: str,
+        embedding: np.ndarray,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Store one embedding for a voice profile. Evicts oldest if over limit."""
+        emb = np.asarray(embedding, dtype=np.float32).ravel()
+        blob = emb.tobytes()
+        dim = emb.shape[0]
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO segment_embeddings (voice_id, session_id, embedding, dim, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (voice_id, session_id, blob, dim, now),
+                )
+                # Evict oldest rows beyond SEGMENT_EMBEDDINGS_MAX for this voice
+                conn.execute(
+                    """
+                    DELETE FROM segment_embeddings
+                    WHERE voice_id = ? AND id NOT IN (
+                        SELECT id FROM segment_embeddings
+                        WHERE voice_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (voice_id, voice_id, SEGMENT_EMBEDDINGS_MAX),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-// ListSessions возвращает последние партии.
-func (s *Store) ListSessions(limit int) ([]SessionRow, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, capture_source, session_mode, speakers_hint, source_filename
-		FROM game_sessions ORDER BY started_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []SessionRow
-	for rows.Next() {
-		var r SessionRow
-		var started string
-		var ended sql.NullString
-		var sh sql.NullInt64
-		var fn sql.NullString
-		if err := rows.Scan(&r.ID, &started, &ended, &r.CaptureSource, &r.SessionMode, &sh, &fn); err != nil {
-			return nil, err
-		}
-		t0, err := time.Parse(time.RFC3339, started)
-		if err != nil {
-			return nil, fmt.Errorf("started_at: %w", err)
-		}
-		r.StartedAt = t0
-		if ended.Valid && ended.String != "" {
-			t1, err := time.Parse(time.RFC3339, ended.String)
-			if err == nil {
-				r.EndedAt = &t1
-			}
-		}
-		if sh.Valid {
-			v := int(sh.Int64)
-			r.SpeakersHint = &v
-		}
-		if fn.Valid {
-			r.SourceFilename = fn.String
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
+    def get_segment_embeddings(self, voice_id: str) -> list[np.ndarray]:
+        """Return all stored embeddings for a voice profile (oldest first)."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT embedding, dim FROM segment_embeddings WHERE voice_id = ? ORDER BY created_at ASC",
+                    (voice_id,),
+                ).fetchall()
+                result = []
+                for row in rows:
+                    arr = np.frombuffer(row["embedding"], dtype=np.float32).reshape(int(row["dim"]))
+                    result.append(arr)
+                return result
+            finally:
+                conn.close()
 
-// GetSession возвращает партию по id.
-func (s *Store) GetSession(id string) (*SessionRow, error) {
-	row := s.db.QueryRow(`
-		SELECT id, started_at, ended_at, capture_source, session_mode, speakers_hint, source_filename
-		FROM game_sessions WHERE id = ?`, id)
-	var r SessionRow
-	var started string
-	var ended sql.NullString
-	var sh sql.NullInt64
-	var fn sql.NullString
-	if err := row.Scan(&r.ID, &started, &ended, &r.CaptureSource, &r.SessionMode, &sh, &fn); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	t0, err := time.Parse(time.RFC3339, started)
-	if err != nil {
-		return nil, err
-	}
-	r.StartedAt = t0
-	if ended.Valid && ended.String != "" {
-		t1, err := time.Parse(time.RFC3339, ended.String)
-		if err == nil {
-			r.EndedAt = &t1
-		}
-	}
-	if sh.Valid {
-		v := int(sh.Int64)
-		r.SpeakersHint = &v
-	}
-	if fn.Valid {
-		r.SourceFilename = fn.String
-	}
-	return &r, nil
-}
+    def get_segment_embeddings_count(self, voice_id: str) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM segment_embeddings WHERE voice_id = ?",
+                    (voice_id,),
+                ).fetchone()
+                return int(row[0]) if row else 0
+            finally:
+                conn.close()
 
-// ListSegments возвращает все реплики партии по порядку seq (с учётом переопределений).
-func (s *Store) ListSegments(sessionID string) ([]SegmentRow, error) {
-	ov, err := s.loadOverridesMap(sessionID)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(`
-		SELECT id, session_id, seq, speaker, voice_id, text, abs_start, abs_end, wall_time, match_score
-		FROM game_segments WHERE session_id = ? ORDER BY seq ASC`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []SegmentRow
-	for rows.Next() {
-		var r SegmentRow
-		var vid sql.NullString
-		var ms sql.NullFloat64
-		if err := rows.Scan(&r.ID, &r.SessionID, &r.Seq, &r.Speaker, &vid, &r.Text, &r.AbsStart, &r.AbsEnd, &r.WallTime, &ms); err != nil {
-			return nil, err
-		}
-		if vid.Valid {
-			r.VoiceID = vid.String
-		}
-		if ms.Valid {
-			v := ms.Float64
-			r.MatchScore = &v
-		}
-		if o, ok := ov[r.Seq]; ok {
-			r.Speaker = o.speaker
-			r.VoiceID = o.voiceID
-			r.OverrideApplied = true
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
+    def reassign_segment_embeddings(self, source_id: str, target_id: str) -> int:
+        """Move all segment embeddings from source to target (used in merge)."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE segment_embeddings SET voice_id = ? WHERE voice_id = ?",
+                    (target_id, source_id),
+                )
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
 
-type overrideRow struct {
-	speaker  string
-	voiceID  string
-}
+    def delete_segment_embeddings(self, voice_id: str) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "DELETE FROM segment_embeddings WHERE voice_id = ?", (voice_id,)
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
-func (s *Store) loadOverridesMap(sessionID string) (map[int]overrideRow, error) {
-	m := make(map[int]overrideRow)
-	rows, err := s.db.Query(
-		`SELECT seq, speaker, voice_id FROM game_segment_overrides WHERE session_id = ?`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var seq int
-		var spk, vid string
-		if err := rows.Scan(&seq, &spk, &vid); err != nil {
-			return nil, err
-		}
-		m[seq] = overrideRow{speaker: spk, voiceID: vid}
-	}
-	return m, rows.Err()
-}
+    def split_segment_embeddings(
+        self,
+        source_id: str,
+        new_id: str,
+        indices_for_new: list[int],
+    ) -> None:
+        """
+        After clustering, reassign a subset of segment_embeddings rows to a new voice.
+        indices_for_new: 0-based positions (oldest-first) to move to new_id.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT id FROM segment_embeddings WHERE voice_id = ? ORDER BY created_at ASC",
+                    (source_id,),
+                ).fetchall()
+                ids_to_move = [rows[i]["id"] for i in indices_for_new if i < len(rows)]
+                if ids_to_move:
+                    placeholders = ",".join("?" * len(ids_to_move))
+                    conn.execute(
+                        f"UPDATE segment_embeddings SET voice_id = ? WHERE id IN ({placeholders})",
+                        [new_id] + ids_to_move,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
 
-// WipeAll удаляет все партии, реплики и переопределения (локальный журнал gateway).
-func (s *Store) WipeAll() error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM game_segment_overrides`); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM game_segments`); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM game_sessions`); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
-}
+    # ── voices CRUD ────────────────────────────────────────────────────────
+
+    def insert_voice(
+        self,
+        centroid: np.ndarray,
+        display_name: Optional[str] = None,
+        voice_id: Optional[str] = None,
+    ) -> str:
+        vid = voice_id or str(uuid.uuid4())
+        centroid = np.asarray(centroid, dtype=np.float32).ravel()
+        blob = centroid.tobytes()
+        dim = centroid.shape[0]
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO voices (voice_id, display_name, centroid, dim, segment_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (vid, display_name, blob, dim, now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return vid
+
+    def update_voice(
+        self,
+        voice_id: str,
+        centroid: np.ndarray,
+        segment_count_delta: int = 0,
+        display_name: Any = None,
+    ) -> None:
+        centroid = np.asarray(centroid, dtype=np.float32).ravel()
+        blob = centroid.tobytes()
+        dim = centroid.shape[0]
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                if display_name is not None:
+                    conn.execute(
+                        """
+                        UPDATE voices SET centroid = ?, dim = ?, segment_count = segment_count + ?,
+                        display_name = ?, updated_at = ?
+                        WHERE voice_id = ?
+                        """,
+                        (blob, dim, segment_count_delta, display_name, now, voice_id),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE voices SET centroid = ?, dim = ?, segment_count = segment_count + ?,
+                        updated_at = ?
+                        WHERE voice_id = ?
+                        """,
+                        (blob, dim, segment_count_delta, now, voice_id),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_display_name(self, voice_id: str, display_name: str) -> bool:
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE voices SET display_name = ?, updated_at = ? WHERE voice_id = ?",
+                    (display_name, now, voice_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def get_voice(self, voice_id: str) -> Optional[VoiceRow]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT * FROM voices WHERE voice_id = ?", (voice_id,)
+                ).fetchone()
+                if row is None:
+                    return None
+                return self._row_to_voice(row)
+            finally:
+                conn.close()
+
+    def list_voices(self) -> list[VoiceRow]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM voices ORDER BY updated_at DESC"
+                ).fetchall()
+                return [self._row_to_voice(r) for r in rows]
+            finally:
+                conn.close()
+
+    def _row_to_voice(self, row: sqlite3.Row) -> VoiceRow:
+        blob = row["centroid"]
+        dim = int(row["dim"])
+        centroid = np.frombuffer(blob, dtype=np.float32).reshape(dim)
+        ur = False
+        try:
+            ur = bool(row["flag_unreliable"])
+        except (KeyError, IndexError, ValueError):
+            pass
+        return VoiceRow(
+            voice_id=row["voice_id"],
+            display_name=row["display_name"],
+            centroid=centroid,
+            segment_count=int(row["segment_count"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+            unreliable=ur,
+        )
+
+    def set_flag_unreliable(self, voice_id: str, unreliable: bool) -> bool:
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE voices SET flag_unreliable = ?, updated_at = ? WHERE voice_id = ?",
+                    (1 if unreliable else 0, now, voice_id),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def wipe_all(self) -> None:
+        """Удалить все голоса, обнулить счётчики, session_max_speakers и segment_embeddings."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("DELETE FROM segment_embeddings")
+                conn.execute("DELETE FROM voice_sub_centroids")
+                conn.execute("DELETE FROM voices")
+                conn.execute(
+                    "UPDATE meta SET value = '0' WHERE key = 'speaker_counter'"
+                )
+                conn.execute(
+                    "UPDATE meta SET value = '' WHERE key = 'session_max_speakers'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_voice(self, voice_id: str) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                # segment_embeddings и voice_sub_centroids удаляются каскадно
+                cur = conn.execute("DELETE FROM voices WHERE voice_id = ?", (voice_id,))
+                conn.commit()
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def merge_voices(self, source_id: str, target_id: str) -> bool:
+        """Merge source into target using segment-count weighted average. Reassigns embeddings."""
+        s = self.get_voice(source_id)
+        t = self.get_voice(target_id)
+        if s is None or t is None:
+            return False
+
+        total_seg = s.segment_count + t.segment_count
+        if total_seg > 0:
+            new_c = (
+                s.centroid.astype(np.float64) * s.segment_count
+                + t.centroid.astype(np.float64) * t.segment_count
+            ) / total_seg
+        else:
+            new_c = (s.centroid.astype(np.float64) + t.centroid.astype(np.float64)) / 2.0
+
+        n = float(np.linalg.norm(new_c))
+        if n > 1e-8:
+            new_c = new_c / n
+
+        blob = np.asarray(new_c, dtype=np.float32).tobytes()
+        dim = new_c.shape[0]
+        now = time.time()
+        with self._lock:
+            conn = self._connect()
+            try:
+                # Reassign segment_embeddings before deleting source
+                conn.execute(
+                    "UPDATE segment_embeddings SET voice_id = ? WHERE voice_id = ?",
+                    (target_id, source_id),
+                )
+                # Удаляем суб-центроиды обоих — registry пересчитает после merge
+                conn.execute(
+                    "DELETE FROM voice_sub_centroids WHERE voice_id IN (?, ?)",
+                    (source_id, target_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE voices SET centroid = ?, dim = ?, segment_count = ?, updated_at = ?
+                    WHERE voice_id = ?
+                    """,
+                    (blob, dim, total_seg, now, target_id),
+                )
+                conn.execute("DELETE FROM voices WHERE voice_id = ?", (source_id,))
+                conn.commit()
+            finally:
+                conn.close()
+        return True

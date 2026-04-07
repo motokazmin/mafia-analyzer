@@ -1,4 +1,4 @@
-"""WhisperX + diarization + WavLM (lazy-loaded)."""
+"""WhisperX + diarization + WavLM + WeSpeaker (lazy-loaded)."""
 
 from __future__ import annotations
 
@@ -18,11 +18,18 @@ except ImportError:
     from transformers import AutoFeatureExtractor
     from transformers.models.wavlm.modeling_wavlm import WavLMForXVector
 
+from pyannote.audio import Model as PyannoteModel
+from pyannote.audio import Inference
+
 from app import config
 
 log = logging.getLogger("voice")
 
 _WAVLM_MODEL = "microsoft/wavlm-base-plus-sv"
+_WESPEAKER_MODEL = "pyannote/wespeaker-voxceleb-resnet34-LM"
+
+# Переключатель: "wavlm" или "wespeaker"
+_EMBEDDING_BACKEND = __import__("os").environ.get("EMBEDDING_BACKEND", "wespeaker").lower()
 
 
 class ModelHolder:
@@ -31,6 +38,7 @@ class ModelHolder:
         self.diarize_model = None
         self.wavlm_model = None
         self.feature_extractor = None
+        self.wespeaker_inference = None
         self.device = config.DEVICE
         self._loaded = False
 
@@ -43,14 +51,26 @@ class ModelHolder:
 
         compute_type = "float16" if self.device == "cuda" else "int8"
 
+        config.THRESHOLD_CONFIDENT_MATCH = 0.55
+        config.THRESHOLD_SOFT_MATCH      = 0.40
+        config.THRESHOLD_FORCE_NEW       = 0.25
+        config.SIMILARITY_UPDATE_MIN     = 0.45
+        config.PENDING_MATCH_THRESHOLD   = 0.35
+
+
+
         log.info("=" * 60)
         log.info("loading models — startup config:")
-        log.info("  device        : %s", self.device.upper())
-        log.info("  compute_type  : %s", compute_type)
-        log.info("  whisper model : %s", config.WHISPER_MODEL)
-        log.info("  wavlm model   : %s", _WAVLM_MODEL)
-        log.info("  language      : ru (fixed)")
-        log.info("  vad_onset     : 0.500  vad_offset: 0.363")
+        log.info("  device           : %s", self.device.upper())
+        log.info("  compute_type     : %s", compute_type)
+        log.info("  whisper model    : %s", config.WHISPER_MODEL)
+        log.info("  embedding backend: %s", _EMBEDDING_BACKEND)
+        if _EMBEDDING_BACKEND == "wavlm":
+            log.info("  wavlm model      : %s", _WAVLM_MODEL)
+        else:
+            log.info("  wespeaker model  : %s", _WESPEAKER_MODEL)
+        log.info("  language         : ru (fixed)")
+        log.info("  vad_onset        : 0.500  vad_offset: 0.363")
         log.info("thresholds:")
         log.info("  confident     : %.2f", config.THRESHOLD_CONFIDENT_MATCH)
         log.info("  soft_match    : %.2f", config.THRESHOLD_SOFT_MATCH)
@@ -86,11 +106,24 @@ class ModelHolder:
         log.info("[2/3] pyannote loaded in %.1fs", time.monotonic() - t1)
 
         t2 = time.monotonic()
-        log.info("[3/3] loading WavLM %s ...", _WAVLM_MODEL)
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(_WAVLM_MODEL)
-        self.wavlm_model = WavLMForXVector.from_pretrained(_WAVLM_MODEL).to(self.device)
-        self.wavlm_model.eval()
-        log.info("[3/3] WavLM loaded in %.1fs", time.monotonic() - t2)
+        if _EMBEDDING_BACKEND == "wavlm":
+            log.info("[3/3] loading WavLM %s ...", _WAVLM_MODEL)
+            self.feature_extractor = AutoFeatureExtractor.from_pretrained(_WAVLM_MODEL)
+            self.wavlm_model = WavLMForXVector.from_pretrained(_WAVLM_MODEL).to(self.device)
+            self.wavlm_model.eval()
+            log.info("[3/3] WavLM loaded in %.1fs", time.monotonic() - t2)
+        else:
+            log.info("[3/3] loading WeSpeaker %s ...", _WESPEAKER_MODEL)
+            _ws_model = PyannoteModel.from_pretrained(
+                _WESPEAKER_MODEL,
+                use_auth_token=config.HF_TOKEN,
+            )
+            self.wespeaker_inference = Inference(
+                _ws_model,
+                window="whole",
+            )
+            self.wespeaker_inference.to(torch.device(self.device))
+            log.info("[3/3] WeSpeaker loaded in %.1fs", time.monotonic() - t2)
 
         total = time.monotonic() - t0
         log.info("all models ready in %.1fs", total)
@@ -104,7 +137,13 @@ class ModelHolder:
         gc.collect()
 
     def run_wavlm(self, combined: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
+        """Извлечение эмбеддинга через активный бэкенд (wavlm или wespeaker)."""
         self.ensure_loaded()
+        if _EMBEDDING_BACKEND == "wespeaker":
+            return self._run_wespeaker(combined, sample_rate)
+        return self._run_wavlm_internal(combined, sample_rate)
+
+    def _run_wavlm_internal(self, combined: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
         try:
             inputs = self.feature_extractor(
                 combined, sampling_rate=sample_rate, return_tensors="pt", padding=True
@@ -115,6 +154,16 @@ class ModelHolder:
             return emb.squeeze().cpu().numpy()
         except Exception as e:
             log.error("WavLM error: %s", e)
+            return None
+
+    def _run_wespeaker(self, combined: np.ndarray, sample_rate: int) -> Optional[np.ndarray]:
+        try:
+            waveform = torch.tensor(combined, dtype=torch.float32).unsqueeze(0)
+            sample_dict = {"waveform": waveform, "sample_rate": sample_rate}
+            emb = self.wespeaker_inference(sample_dict)
+            return np.array(emb)
+        except Exception as e:
+            log.error("WeSpeaker error: %s", e)
             return None
 
     def transcribe_align(self, audio: np.ndarray) -> tuple[dict[str, Any], np.ndarray]:
